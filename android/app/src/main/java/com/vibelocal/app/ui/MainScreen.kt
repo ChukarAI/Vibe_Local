@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Forum
+import androidx.compose.material.icons.outlined.Hub
 import androidx.compose.material.icons.outlined.Leaderboard
 import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material.icons.outlined.Speed
@@ -36,6 +37,8 @@ import com.vibelocal.app.VibeLocalApp
 import com.vibelocal.app.core.ThermalGovernor
 import com.vibelocal.app.ui.chat.ChatScreen
 import com.vibelocal.app.ui.chat.ChatViewModel
+import com.vibelocal.app.ui.grid.GridScreen
+import com.vibelocal.app.ui.grid.GridViewModel
 import com.vibelocal.app.ui.leaderboard.LeaderboardScreen
 import com.vibelocal.app.ui.leaderboard.LeaderboardViewModel
 import com.vibelocal.app.ui.scan.ScanMatchScreen
@@ -54,6 +57,7 @@ enum class VibeTab(val labelRes: Int, val icon: ImageVector) {
     LEADERBOARD(R.string.tab_leaderboard, Icons.Outlined.Leaderboard),
     VIBEMARK(R.string.tab_vibemark, Icons.Outlined.Speed),
     CHAT(R.string.tab_chat, Icons.Outlined.Forum),
+    GRID(R.string.tab_grid, Icons.Outlined.Hub),
 }
 
 @Composable
@@ -65,6 +69,7 @@ fun MainScreen() {
     val leaderboardVm: LeaderboardViewModel = viewModel(factory = LeaderboardViewModel.Factory)
     val vibeMarkVm: VibeMarkViewModel = viewModel(factory = VibeMarkViewModel.Factory)
     val chatVm: ChatViewModel = viewModel(factory = ChatViewModel.Factory)
+    val gridVm: GridViewModel = viewModel(factory = GridViewModel.Factory)
 
     var selectedTab by rememberSaveable { mutableStateOf(VibeTab.SCAN) }
 
@@ -134,6 +139,7 @@ fun MainScreen() {
                     VibeTab.LEADERBOARD -> LeaderboardScreen(leaderboardVm)
                     VibeTab.VIBEMARK -> VibeMarkScreen(vibeMarkVm)
                     VibeTab.CHAT -> ChatScreen(chatVm)
+                    VibeTab.GRID -> GridScreen(gridVm)
                 }
             }
         }

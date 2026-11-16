@@ -38,12 +38,28 @@ class AppPrefs(context: Context) {
         get() = sp.getBoolean(KEY_STRIP_THINK, true)
         set(value) = sp.edit().putBoolean(KEY_STRIP_THINK, value).apply()
 
+    /** Vibe Grid coordinator URL (the fleet brain, default port 7900). */
+    var gridCoordinator: String
+        get() = sp.getString(KEY_GRID_COORDINATOR, DEFAULT_GRID_COORDINATOR) ?: DEFAULT_GRID_COORDINATOR
+        set(value) = sp.edit().putString(KEY_GRID_COORDINATOR, value).apply()
+
+    /** Vibe Grid fleet secret (X-Compost-Key). */
+    var gridKey: String
+        get() = sp.getString(KEY_GRID_KEY, "") ?: ""
+        set(value) = sp.edit().putString(KEY_GRID_KEY, value).apply()
+
+    /** Local worker concurrency for the grid agent. */
+    var gridWorkers: Int
+        get() = sp.getInt(KEY_GRID_WORKERS, 2).coerceIn(1, 16)
+        set(value) = sp.edit().putInt(KEY_GRID_WORKERS, value.coerceIn(1, 16)).apply()
+
     companion object {
         const val DEFAULT_REMOTE_HOST = "http://127.0.0.1:20129"
         const val DEFAULT_PROFILE = "nothing_phone_2a"
         const val DEFAULT_IDLE_TIMEOUT = 300
         const val MIN_IDLE_TIMEOUT = 60
         const val MAX_IDLE_TIMEOUT = 1800
+        const val DEFAULT_GRID_COORDINATOR = "http://127.0.0.1:7900"
 
         private const val KEY_REMOTE_HOST = "remote_host"
         private const val KEY_REMOTE_TOKEN = "remote_token"
@@ -52,5 +68,8 @@ class AppPrefs(context: Context) {
         private const val KEY_SAF_TREE = "saf_tree_uri"
         private const val KEY_LAST_PROFILE = "last_profile"
         private const val KEY_STRIP_THINK = "strip_think"
+        private const val KEY_GRID_COORDINATOR = "grid_coordinator"
+        private const val KEY_GRID_KEY = "grid_key"
+        private const val KEY_GRID_WORKERS = "grid_workers"
     }
 }

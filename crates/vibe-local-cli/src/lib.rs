@@ -6,8 +6,10 @@
 //!
 //! Licensed under Apache-2.0.
 
+pub mod cluster_cli;
 pub mod commands;
 pub mod discovery;
+pub mod grid_proxy;
 pub mod server;
 
 pub use server::{DEFAULT_PORT, ServerConfig, ServerHandle, start_server};

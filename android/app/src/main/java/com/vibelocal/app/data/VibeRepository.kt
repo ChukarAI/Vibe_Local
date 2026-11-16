@@ -240,6 +240,95 @@ class VibeRepository(
         }
     }
 
+    // ------------------------------------------------------------- vibe grid
+
+    /** Start the pull-based worker agent (native only; outward connections). */
+    suspend fun gridAgentStart(workers: Int): Result<JSONObject> = withContext(Dispatchers.IO) {
+        if (!nativeAvailable) {
+            return@withContext Result.failure(IOException("Grid worker requires the native engine"))
+        }
+        val dir = dataDirs.dataDirPath
+        bridgeToResult(
+            SafeBridge.clusterAgentStart(prefs.gridCoordinator, prefs.gridKey, workers, android.os.Build.MODEL ?: "android", dir)
+        ) { it as JSONObject }
+    }
+
+    suspend fun gridAgentStop(): Result<Unit> = withContext(Dispatchers.IO) {
+        if (nativeAvailable) {
+            bridgeToResult(SafeBridge.clusterAgentStop()) { Unit }
+        } else {
+            Result.failure(IOException("Grid worker requires the native engine"))
+        }
+    }
+
+    /** Fleet health + state; HTTP fallback talks to the coordinator directly. */
+    suspend fun gridStatus(): Result<JSONObject> = withContext(Dispatchers.IO) {
+        if (nativeAvailable) {
+            bridgeToResult(SafeBridge.clusterStatusJson(prefs.gridCoordinator, prefs.gridKey)) { it as JSONObject }
+        } else {
+            gridHttpGet("/healthz").mapCatching { health ->
+                val state = gridHttpGet("/api/v1/state").getOrThrow()
+                JSONObject().put("health", health).put("state", state)
+            }
+        }
+    }
+
+    /** MoE expert shard plan across the live fleet. */
+    suspend fun gridPlanMoe(modelId: String, context: Int): Result<JSONObject> = withContext(Dispatchers.IO) {
+        if (nativeAvailable) {
+            bridgeToResult(SafeBridge.clusterPlanMoeJson(modelId, context, prefs.gridCoordinator, prefs.gridKey)) { it as JSONObject }
+        } else {
+            // Without native, plan against the local device only via the
+            // Vibe-Link proxy if reachable; otherwise report the limitation.
+            Result.failure(IOException("MoE planning requires the native engine"))
+        }
+    }
+
+    suspend fun gridSubmitJob(body: JSONObject): Result<JSONObject> = withContext(Dispatchers.IO) {
+        gridHttpPost("/api/v1/jobs", body).mapCatching { it as JSONObject }
+    }
+
+    suspend fun gridCancelJob(jobId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        gridHttpPost("/api/v1/jobs/$jobId/cancel", JSONObject()).map { Unit }
+    }
+
+    suspend fun gridCoordinatorStart(addr: String, protectArtifacts: Boolean): Result<JSONObject> =
+        withContext(Dispatchers.IO) {
+            if (!nativeAvailable) {
+                return@withContext Result.failure(IOException("Coordinator requires the native engine"))
+            }
+            val statePath = java.io.File(dataDirs.dataDirPath, "grid-state.json.gz").absolutePath
+            bridgeToResult(SafeBridge.clusterCoordinatorStart(addr, prefs.gridKey, protectArtifacts, statePath)) { it as JSONObject }
+        }
+
+    suspend fun gridCoordinatorStop(): Result<Unit> = withContext(Dispatchers.IO) {
+        if (nativeAvailable) {
+            bridgeToResult(SafeBridge.clusterCoordinatorStop()) { Unit }
+        } else {
+            Result.failure(IOException("Coordinator requires the native engine"))
+        }
+    }
+
+    private fun gridHttpGet(path: String): Result<Any> {
+        val saved = http.token
+        http.token = prefs.gridKey
+        try {
+            return http.getJson(prefs.gridCoordinator, path)
+        } finally {
+            http.token = saved
+        }
+    }
+
+    private fun gridHttpPost(path: String, body: JSONObject): Result<Any> {
+        val saved = http.token
+        http.token = prefs.gridKey
+        try {
+            return http.postJson(prefs.gridCoordinator, path, body)
+        } finally {
+            http.token = saved
+        }
+    }
+
     companion object {
         const val DEFAULT_PORT = 20129
         const val LOCAL_BASE = "http://127.0.0.1:$DEFAULT_PORT"

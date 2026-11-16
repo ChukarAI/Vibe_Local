@@ -5,6 +5,7 @@ members = [
     "crates/vibe-local-engine",
     "crates/vibe-local-cli",
     "crates/vibe-local-jni",
+    "crates/vibe-local-cluster",
 ]
 
 [workspace.package]
@@ -26,10 +27,15 @@ tiny_http = "0.12"
 jni = "0.21"
 getrandom = "0.2"
 libc = "0.2"
+flate2 = "1"
+png = "0.17"
+sha2 = "0.10"
+base64 = "0.22"
 tempfile = "3"
 vibe-local-core = { path = "crates/vibe-local-core" }
 vibe-local-engine = { path = "crates/vibe-local-engine" }
 vibe-local-cli = { path = "crates/vibe-local-cli" }
+vibe-local-cluster = { path = "crates/vibe-local-cluster" }
 
 [profile.release]
 lto = "thin"

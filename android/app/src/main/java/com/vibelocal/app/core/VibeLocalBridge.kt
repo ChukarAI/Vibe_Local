@@ -47,4 +47,18 @@ object VibeLocalBridge {
     external fun setThermalReading(celsius: Double): String
 
     external fun setIdleTimeout(seconds: Int): String
+
+    // --- Vibe Grid cluster (compost v0.7.0 wire-compatible) ---
+
+    external fun clusterAgentStart(coordinatorUrl: String, key: String, workers: Int, name: String, dataDir: String): String
+
+    external fun clusterAgentStop(): String
+
+    external fun clusterStatusJson(coordinatorUrl: String, key: String): String
+
+    external fun clusterPlanMoeJson(modelId: String, context: Int, coordinatorUrl: String, key: String): String
+
+    external fun clusterCoordinatorStart(addr: String, key: String, protectArtifacts: Boolean, statePath: String): String
+
+    external fun clusterCoordinatorStop(): String
 }

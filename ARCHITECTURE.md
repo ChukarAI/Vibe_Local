@@ -42,6 +42,13 @@ This document describes the system design of Vibe Local: a zero-cloud local infe
 
 Every crate declares `license = "Apache-2.0"` and `edition = "2024"` via `[workspace.package]` inheritance.
 
+> **Wave 2** adds a fifth crate, `vibe-local-cluster` (Vibe Grid): the compost
+> v0.7.0 coordinator/agent port plus distributed MoE Wi-Fi sharding. It
+> depends on `vibe-local-core` (hardware, GGUF, util) and `vibe-local-engine`
+> (thermal reads); `vibe-local-cli` embeds it for the `cluster` subcommands
+> and the same-origin `/api/grid/*` proxy; `vibe-local-jni` exposes it to
+> Android. See §§11–15 below.
+
 ## 2. Core crate (`vibe-local-core`)
 
 ### 2.1 HardwareProbe (`hardware.rs`)
@@ -186,3 +193,123 @@ vibe-local bench Qwen2.5-Coder-7B
 ## 10. Verification
 
 `cargo fmt --all -- --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo test --workspace` · `cargo build --release` · `python benchmarks/kaggle_10pillar_bench.py --self-test`. Tests cover GGUF parsing (synthetic binaries), SSRF classification, tier decisions for the three reference devices, Pareto math, DB WAL/busy-timeout, LAN auth/CSRF enforcement, router headers, think-stripping, thermal hysteresis, mDNS wire format and the JNI/C-ABI surface.
+
+---
+
+# Wave 2 — Vibe Grid (distributed compute + Wi-Fi MoE)
+
+## 11. Ghost-GPU fix (`vibe-local-core`)
+
+The Windows display-class registry key (`{4d36e968-…}`) retains **historical
+driver entries** for cards no longer plugged in (e.g. an RX 470 and GT 730
+that were removed, leaving only the RX 580). `windows_gpus()` now cross-checks
+every registry subkey against:
+
+1. **PnP presence** — `SetupDiGetClassDevsW(DIGCF_PRESENT)` +
+   `SetupDiGetDeviceRegistryPropertyW(SPDRP_DRIVER)`; the returned
+   `{guid}\000x` value is reduced to its subkey and matched.
+2. **Desktop attachment** — `EnumDisplayDevicesW` with
+   `DISPLAY_DEVICE_ACTIVE`, filtering present-but-inactive adapters (e.g. a
+   disabled iGPU while a discrete card drives the display).
+
+Verified on the reference host: `vibe-local scan` reports **only** the active
+`Radeon RX 580 Series (8192 MB, vulkan)`; tier `gpu_dense`.
+
+## 12. `vibe-local-cluster` — compost v0.7.0 port
+
+A native Rust port of the Cluster (`compost`) architecture; **no separate Go
+project is needed**. The HTTP wire protocol (`/api/v1/*`) is field-compatible
+with compost v0.7.0 (JSON, base64 `[]byte`, `X-Compost-Key`), so existing
+agents/dashboards interoperate. The on-disk snapshot is JSON+gzip (v4
+semantics, v3 defaults) rather than Go gob.
+
+| Module | Responsibility |
+|---|---|
+| `proto` | Wire types: Caps, Node, Task, ResultMsg, Job, Poll/Heartbeat/Join envelopes; `SubmitJobRequest` accepts numeric params + string options in params/meta/mode |
+| `auth` | Constant-time `X-Compost-Key` + `?key=` fallback enforcer |
+| `scheduler` | The queue: two-pass fair + priority `lease_batch` (pass 1 = 1/job, pass 2 = priority-weighted), LPT biggest-first, adaptive leases `15s + 4×est/speed` capped 30min, monotonic `LeaseEpoch`, `renew_leases` (5s heartbeats, ≤4×cap total hold), Sybil-safe replication (distinct session **and** NodeUUID **and** IP), poison cap 5, `reclaim_job_payloads`, reaper (offline 20s / forget 10min), EWMA speed learning (`prior_n=3.0`, `alpha=0.3`, per-preset + global), save/restore |
+| `server` | Coordinator: tiny_http workers, gzip body decoding under a **9MiB cap (413)**, 8MiB job-input cap, 8 concurrent jobs, artifact assembly threads + **8-entry LRU** + disk offload, auth-before-cache (no LRU thrashing), state redaction, ETA/Waiting annotation, `/healthz`, Prometheus `/metrics` (compost metric names), 10s persistence loop, embedded CSP-safe dashboard |
+| `agent` | Outward-only worker: join w/ full-jitter backoff, poll batches, worker pool (1–16), `ExecMillis` strictly around execute, inflight epoch tracking + 5s heartbeats, async upload loop (gzip >4KiB), battery/thermal pause reasons, flush on stop |
+| `node` | Caps via core HardwareProbe + battery (Win `GetSystemPowerStatus`, Linux/Android sysfs, macOS pmset) + engine thermal; xorshift64 benchmark (identical kernel cross-arch); `.vibe-node-id` persistent UUIDv4 with SHA-256 hardware fingerprint fallback (hostname/os/arch/cores/MACs); `:20129` LLM probe (300ms, 10s cache) |
+| `workload` | Preset SPI + `mandelbrot` (exact tile geometry/palette, PNG, ≤0.05% edge-pixel replica tolerance), `primes` (6k±1, π-verified), `wordcount` (word-aligned map/reduce), `llm_batch` (JSONL/MD/lines, verify mode, live `:20129`), `moe_distributed` |
+| `persist` | Gzipped JSON snapshots v4 (v3-compatible defaults) |
+| `moe_grid` | Distributed MoE planner + fault-tolerant shard router (below) |
+
+### Guards (agent + scheduler, both sides)
+
+- Battery `<30%` while on battery → pause (agent-side overridable; scheduler
+  always enforces).
+- CPU `>80°C` → pause; **Android battery `>45°C`** → pause. Never overridable.
+- Paused nodes are excluded from leasing and MoE placement; the reason is
+  surfaced on dashboards.
+
+## 13. Distributed MoE over Wi-Fi (`moe_grid.rs`)
+
+**Why MoE:** dense pipeline parallelism pays Wi-Fi RTT on every layer; sparse
+MoE activates only top-k experts per token, so expert shards can live on
+different devices and only routed activations cross the network.
+
+`MoeModelSpec` registry holds public expert topology (OLMoE 64×top-8,
+Granite-3.1-3B-A800M 64×top-8, Qwen1.5-MoE 60×top-4 + 4 shared,
+DeepSeek-V2-Lite 64×top-6 + 2 shared). `spec_from_gguf` refines it from a real
+file's `expert_count`/`expert_used_count`.
+
+**`plan_moe(spec, nodes, quant, ctx, rtt)`**:
+1. Filter usable nodes (online, unpaused, RAM > 0); coordinator = flagged
+   node or highest weight.
+2. Quotas ∝ `usable_ram_mb × speed_factor`; coordinator quota includes the
+   backbone (embedding/attention/gating weights + KV + overhead).
+3. Capacity clamp; nodes that can't hold one expert → **speculative draft**
+   role (draft N tokens, coordinator verifies in one pass).
+4. Experts placed hottest-first (Zipf prior) in contiguous ranges:
+   coordinator takes the hottest block, workers fastest-first. Overflow pages
+   onto the coordinator.
+5. Throughput estimate from the slowest holder's speed, sparsity ratio and
+   Wi-Fi RTT penalty.
+
+**Fault tolerance:** `reroute_after_drop` / `MoeGridRouter::on_node_drop`
+reassign a failed node's shards to the survivor with the most headroom, or
+mark them `host_paging` on the coordinator; backbone loss promotes the
+strongest survivor. Coverage of all experts is invariant — the generation
+stream never crashes on churn.
+
+**Real paging:** `page_in_experts` reads the actual stacked `ffn_*_exps`
+tensor slices from the GGUF (the core parser now exposes tensor infos +
+`data_offset`), touching pages so the OS residents them.
+
+**`moe_distributed` preset:** the server injects the live fleet plan at
+submit time; each shard task executes real work — `weight_stream` mode
+streams its expert byte range from a local GGUF (measured bandwidth), else
+`routing_probe` computes deterministic top-k gating decisions (FNV-1a) over
+the prompt's tokens for its expert range. Aggregate is a JSON shard report.
+Cross-device token generation via llama.cpp ggml-rpc is the documented next
+step; today the coordinator's engine generates while the grid validates and
+measures the partition.
+
+## 14. Integration surfaces
+
+- **CLI:** `vibe-local cluster coordinator|agent|plan-moe|submit|status|nodes|jobs|cancel`.
+- **Vibe-Link proxy (`grid_proxy.rs`):** same-origin `/api/grid/state|plan|jobs|cancel|tiles|artifact`
+  on :20129 forwards to the :7900 coordinator (keeps web CSP `connect-src 'self'`).
+  LAN-proxy URL validation allows loopback/RFC1918 (the fleet lives there) but
+  blocks link-local/multicast/unspecified; `X-Compost-Key` is forwarded.
+- **Web:** fifth "Vibe Grid" tab — fleet cards with guard badges, canvas-free
+  segmented expert shard map, plan controls, jobs table with progress/tiles,
+  submit form; polls only while active; all safe-DOM.
+- **JNI/Android:** `clusterAgentStart/Stop`, `clusterStatusJson`,
+  `clusterPlanMoeJson`, `clusterCoordinatorStart/Stop`; fifth Compose tab with
+  worker pairing, fleet status, MoE planner (Canvas shard bar), job submit and
+  coordinator mode. The phone joins outward — no inbound ports.
+
+## 15. Wave 2 verification
+
+Cluster tests (59) cover: epoch monotonicity + stale rejection, heartbeat
+renewal, lease expiry → poison failure, batch fairness/priority/LPT, Sybil
+UUID/IP guards (lease- and result-time), replica mismatch, EWMA prior math,
+battery/thermal/Android guards, LLM gating, reclamation, save/restore,
+unsupported fast-fail; coordinator end-to-end primes pipeline with persistence
++ artifact + reclaim, auth/redaction/protect-artifacts, gzip-bomb 413, ETA;
+agent end-to-end primes; MoE heterogeneous partitioning (PC 8GB VRAM + 12GB/6GB
+phones), draft fallback, node-drop reroute + backbone promotion, real GGUF
+expert paging; JNI coordinator+agent+plan round-trip. Ghost-GPU fix verified
+live on the reference host (only RX 580 reported).

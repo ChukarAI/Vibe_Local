@@ -204,3 +204,44 @@ header automatically whenever a token is configured.
   WakeLock uses a matching safety timeout.
 - Gated Hugging Face repos need auth headers that DownloadManager cannot
   carry anonymously; such downloads will fail with an HTTP error.
+## Vibe Grid (Wi-Fi MoE & Cluster)
+
+The fifth tab turns the phone into a node of the **Vibe Grid** distributed
+compute fleet — a Rust port of compost v0.7.0 (`crates/vibe-local-cluster`),
+wire-compatible with the original Go protocol (`/api/v1/*`).
+
+### Pairing as a worker
+
+1. On the PC: `vibe-local cluster coordinator --addr 0.0.0.0:7900 --key <secret> --state grid-state.gz`
+2. On the phone (Vibe Grid tab): enter `http://<pc-lan-ip>:7900` and the fleet
+   key, choose worker concurrency (1–16), press **Start worker**.
+3. The agent joins outward over Wi-Fi — **no inbound ports are opened on the
+   phone**. It polls for tasks, executes them locally, renews leases with a
+   5s heartbeat, and uploads gzip-compressed results.
+
+Safety guards are enforced natively: battery <30% (on battery) pauses work,
+CPU >80°C or Android battery >45°C pauses work, and the coordinator's
+adaptive leases scale with the phone's learned EWMA speed factor so throttled
+devices are never falsely reaped mid-task.
+
+### MoE planner
+
+Pick a sparse MoE model (OLMoE-1B-7B, Granite-3.1-3B-A800M, Qwen1.5-MoE-A2.7B,
+DeepSeek-V2-Lite-16B) and a context length, then **Plan MoE**. The planner
+partitions routed experts across the live fleet proportional to
+`usable_ram_mb × speed_factor`: the coordinator keeps the backbone + hottest
+experts, phones take contiguous expert ranges, and tiny nodes become
+speculative draft generators. If a phone drops, its shard re-routes to
+another node or pages into coordinator host RAM — the stream survives.
+
+### Coordinator mode
+
+Advanced section: the phone can host the fleet brain itself
+(`clusterCoordinatorStart`), with optional artifact protection and a
+persistent state snapshot under the app data dir.
+
+### JNI surface
+
+`clusterAgentStart / clusterAgentStop / clusterStatusJson /
+clusterPlanMoeJson / clusterCoordinatorStart / clusterCoordinatorStop` —
+all return the standard `{"ok":..,"data":..}` envelope via `SafeBridge`.

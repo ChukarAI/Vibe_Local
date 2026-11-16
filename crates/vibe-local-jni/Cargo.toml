@@ -18,6 +18,7 @@ jni.workspace = true
 vibe-local-core.workspace = true
 vibe-local-engine.workspace = true
 vibe-local-cli.workspace = true
+vibe-local-cluster.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

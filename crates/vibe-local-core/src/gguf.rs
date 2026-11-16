@@ -50,6 +50,22 @@ impl GgufValue {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GgufTensor {
+    pub name: String,
+    pub dims: Vec<u64>,
+    pub ty: u32,
+    /// Byte offset of the tensor data relative to the start of the file's
+    /// data section (after all tensor infos + alignment padding).
+    pub offset: u64,
+}
+
+impl GgufTensor {
+    pub fn n_elements(&self) -> u64 {
+        self.dims.iter().product::<u64>().max(1)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextRam {
     pub ctx: u64,
     pub weights_mb: f64,
@@ -78,6 +94,9 @@ pub struct GgufInfo {
     pub is_moe: bool,
     pub file_size_bytes: u64,
     pub kv: BTreeMap<String, GgufValue>,
+    pub tensors: Vec<GgufTensor>,
+    /// Absolute file offset where tensor data begins (infos + padding).
+    pub data_offset: u64,
     pub ram: Vec<ContextRam>,
 }
 
@@ -133,6 +152,7 @@ pub fn quant_from_filename(name: &str) -> Option<String> {
 struct Reader<R: Read> {
     inner: R,
     remaining_budget: u64,
+    consumed: u64,
 }
 
 impl<R: Read> Reader<R> {
@@ -141,6 +161,7 @@ impl<R: Read> Reader<R> {
         Self {
             inner,
             remaining_budget: 64 * 1024 * 1024,
+            consumed: 0,
         }
     }
     fn take(&mut self, n: usize) -> anyhow::Result<Vec<u8>> {
@@ -150,6 +171,7 @@ impl<R: Read> Reader<R> {
         let mut buf = vec![0u8; n];
         self.inner.read_exact(&mut buf)?;
         self.remaining_budget -= n as u64;
+        self.consumed += n as u64;
         Ok(buf)
     }
     fn u8(&mut self) -> anyhow::Result<u8> {
@@ -288,6 +310,34 @@ pub fn parse_reader<R: Read>(read: R) -> anyhow::Result<GgufInfo> {
     let expert_used_count = get(&format!("{arch}.expert_used_count"));
     let is_moe = expert_count.unwrap_or(0) > 0;
 
+    // Tensor infos follow the KV block: name, n_dims, dims[], type, offset.
+    let mut tensors = Vec::new();
+    for _ in 0..tensor_count.min(1 << 20) {
+        let name = r.string()?;
+        let n_dims = r.u32()?;
+        anyhow::ensure!(n_dims <= 8, "implausible tensor rank {n_dims}");
+        let mut dims = Vec::with_capacity(n_dims as usize);
+        for _ in 0..n_dims {
+            dims.push(r.u64()?);
+        }
+        let ty = r.u32()?;
+        let offset = r.u64()?;
+        tensors.push(GgufTensor {
+            name,
+            dims,
+            ty,
+            offset,
+        });
+    }
+    let bytes_consumed = r.consumed;
+    // Data section starts at the next alignment boundary (default 32 bytes).
+    let alignment = kv
+        .get("general.alignment")
+        .and_then(GgufValue::as_u64)
+        .unwrap_or(32)
+        .max(1);
+    let data_offset = bytes_consumed.div_ceil(alignment) * alignment;
+
     Ok(GgufInfo {
         path: String::new(),
         version,
@@ -307,6 +357,8 @@ pub fn parse_reader<R: Read>(read: R) -> anyhow::Result<GgufInfo> {
         is_moe,
         file_size_bytes: 0,
         kv,
+        tensors,
+        data_offset,
         ram: Vec::new(),
     })
 }
@@ -386,6 +438,20 @@ mod tests {
             buf.extend_from_slice(&ty.to_le_bytes());
             buf.extend_from_slice(&val);
         }
+        // Two tensor infos: name, n_dims, dims[], type, offset.
+        for (name, dims, ty, off) in [
+            ("token_embd.weight", vec![3584u64, 151936], 15u32, 0u64),
+            ("blk.0.attn_q.weight", vec![3584u64, 3584], 15, 1024),
+        ] {
+            buf.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+            buf.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for d in &dims {
+                buf.extend_from_slice(&d.to_le_bytes());
+            }
+            buf.extend_from_slice(&ty.to_le_bytes());
+            buf.extend_from_slice(&off.to_le_bytes());
+        }
         buf
     }
 
@@ -401,6 +467,14 @@ mod tests {
         assert_eq!(info.block_count, Some(28));
         assert_eq!(info.head_count_kv, Some(4));
         assert!(!info.is_moe);
+        assert_eq!(info.tensors.len(), 2);
+        assert_eq!(info.tensors[0].name, "token_embd.weight");
+        assert_eq!(info.tensors[0].dims, vec![3584, 151936]);
+        assert_eq!(info.tensors[1].offset, 1024);
+        // Tensor offsets are relative to the data section, which starts at
+        // the aligned end of the header.
+        assert!(info.data_offset > 0);
+        assert_eq!(info.data_offset % 32, 0);
     }
 
     #[test]

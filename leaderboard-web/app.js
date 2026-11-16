@@ -15,8 +15,9 @@ import { createDegradationView } from './js/degradation.js';
 import { createMatrixView } from './js/matrix.js';
 import { createDetailDrawer } from './js/detail.js';
 import { createSubmitView } from './js/submit.js';
+import { createGridView } from './js/grid.js';
 
-const TABS = ['pareto', 'degradation', 'matrix', 'submit'];
+const TABS = ['pareto', 'degradation', 'matrix', 'submit', 'grid'];
 
 const state = {
   mode: null,            // 'live' | 'catalog'
@@ -66,7 +67,7 @@ const submitView = createSubmitView(panels.submit, {
     if (state.mode === 'live') load(state.profileId, { silent: true });
   },
 });
-const views = { pareto: scatter, degradation, matrix, submit: submitView };
+const views = { pareto: scatter, degradation, matrix, submit: submitView, grid: createGridView(panels.grid) };
 
 // ----- banner -----
 function renderBanner(kind, message) {
@@ -181,6 +182,8 @@ function activateTab(tab, { focus = false } = {}) {
   }
   positionInk();
   if (focus) tabButtons[tab].focus();
+  // The grid view polls only while its tab is active.
+  if (views.grid && typeof views.grid.setActive === 'function') views.grid.setActive(tab === 'grid');
   try {
     history.replaceState(null, '', `#${tab}`);
   } catch { /* file:// or sandboxed — ignore */ }

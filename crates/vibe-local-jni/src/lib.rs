@@ -70,6 +70,10 @@ fn with_state<T>(
     f(guard.as_mut().unwrap())
 }
 
+fn wrap_call(f: impl FnOnce() -> anyhow::Result<Value>) -> Value {
+    wrap(f())
+}
+
 fn wrap(result: anyhow::Result<Value>) -> Value {
     match result {
         Ok(v) => json!({"ok": true, "data": v}),
@@ -237,7 +241,7 @@ fn api_set_idle(seconds: u64) -> Value {
 }
 
 fn api_set_data_dir(data_dir: &str) -> Value {
-    wrap((|| {
+    wrap_call(|| {
         let mut guard = state_cell().lock().unwrap();
         if let Some(s) = guard.as_mut() {
             if s.server.is_some() {
@@ -249,7 +253,7 @@ fn api_set_data_dir(data_dir: &str) -> Value {
             s.data_dir = dir;
         }
         Ok(json!({"data_dir": data_dir}))
-    })())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +430,204 @@ pub extern "system" fn Java_com_vibelocal_app_core_VibeLocalBridge_setDataDir(
 }
 
 // ---------------------------------------------------------------------------
+// Vibe Grid cluster bridge
+// ---------------------------------------------------------------------------
+
+static GRID_AGENT: Mutex<Option<Arc<vibe_local_cluster::AgentHandle>>> = Mutex::new(None);
+static GRID_COORDINATOR: Mutex<Option<Arc<vibe_local_cluster::CoordinatorHandle>>> =
+    Mutex::new(None);
+
+fn api_cluster_agent_start(
+    coordinator_url: &str,
+    key: &str,
+    workers: i32,
+    name: &str,
+    data_dir: &str,
+) -> Value {
+    wrap_call(|| {
+        let mut guard = GRID_AGENT.lock().unwrap();
+        if let Some(old) = guard.take() {
+            old.stop();
+        }
+        let dir = if data_dir.is_empty() {
+            default_data_dir()
+        } else {
+            PathBuf::from(data_dir)
+        };
+        std::fs::create_dir_all(&dir)?;
+        let handle = vibe_local_cluster::start_agent(vibe_local_cluster::AgentConfig {
+            coordinator: coordinator_url.to_string(),
+            name: name.to_string(),
+            key: key.to_string(),
+            node_id_file: dir.join(".vibe-node-id").to_string_lossy().into_owned(),
+            workers: workers.clamp(1, 16) as usize,
+            ..Default::default()
+        })?;
+        let node_id = handle.node_id();
+        *guard = Some(handle);
+        Ok(json!({"node_id": node_id, "coordinator": coordinator_url}))
+    })
+}
+
+fn api_cluster_agent_stop() -> Value {
+    wrap_call(|| {
+        if let Some(handle) = GRID_AGENT.lock().unwrap().take() {
+            handle.stop();
+        }
+        Ok(json!({"stopped": true}))
+    })
+}
+
+fn api_cluster_status(coordinator_url: &str, key: &str) -> Value {
+    wrap_call(|| {
+        let base = if coordinator_url.is_empty() {
+            vibe_local_cli::grid_proxy::DEFAULT_COORDINATOR.to_string()
+        } else {
+            coordinator_url.trim_end_matches('/').to_string()
+        };
+        let key = if key.is_empty() { None } else { Some(key) };
+        vibe_local_cli::grid_proxy::status_combined(&base, key)
+    })
+}
+
+fn api_cluster_plan_moe(model_id: &str, context: u64, coordinator_url: &str, key: &str) -> Value {
+    wrap_call(|| {
+        let base = if coordinator_url.is_empty() {
+            vibe_local_cli::grid_proxy::DEFAULT_COORDINATOR.to_string()
+        } else {
+            coordinator_url.trim_end_matches('/').to_string()
+        };
+        let key = if key.is_empty() { None } else { Some(key) };
+        vibe_local_cli::grid_proxy::plan_moe_live(model_id, context.max(512), &base, key)
+    })
+}
+
+fn api_cluster_coordinator_start(
+    addr: &str,
+    key: &str,
+    protect_artifacts: bool,
+    state_path: &str,
+) -> Value {
+    wrap_call(|| {
+        let mut guard = GRID_COORDINATOR.lock().unwrap();
+        if let Some(old) = guard.take() {
+            old.shutdown();
+        }
+        let handle =
+            vibe_local_cluster::start_coordinator(vibe_local_cluster::CoordinatorOptions {
+                addr: if addr.is_empty() {
+                    "0.0.0.0:7900".to_string()
+                } else {
+                    addr.to_string()
+                },
+                key: key.to_string(),
+                protect_artifacts,
+                allow_same_ip_replicate: false,
+                state_path: if state_path.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(state_path))
+                },
+            })?;
+        let port = handle.port;
+        *guard = Some(handle);
+        Ok(json!({"port": port}))
+    })
+}
+
+fn api_cluster_coordinator_stop() -> Value {
+    wrap_call(|| {
+        if let Some(handle) = GRID_COORDINATOR.lock().unwrap().take() {
+            handle.shutdown();
+        }
+        Ok(json!({"stopped": true}))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_vibelocal_app_core_VibeLocalBridge_clusterAgentStart(
+    mut env: JNIEnv,
+    _class: JClass,
+    coordinator_url: JString,
+    key: JString,
+    workers: jint,
+    name: JString,
+    data_dir: JString,
+) -> jstring {
+    let url = jstr(&mut env, &coordinator_url);
+    let key = jstr(&mut env, &key);
+    let name = jstr(&mut env, &name);
+    let dir = jstr(&mut env, &data_dir);
+    guarded(&mut env, move || {
+        api_cluster_agent_start(&url, &key, workers, &name, &dir)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_vibelocal_app_core_VibeLocalBridge_clusterAgentStop(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    guarded(&mut env, api_cluster_agent_stop)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_vibelocal_app_core_VibeLocalBridge_clusterStatusJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    coordinator_url: JString,
+    key: JString,
+) -> jstring {
+    let url = jstr(&mut env, &coordinator_url);
+    let key = jstr(&mut env, &key);
+    guarded(&mut env, move || api_cluster_status(&url, &key))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_vibelocal_app_core_VibeLocalBridge_clusterPlanMoeJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    model_id: JString,
+    context: jint,
+    coordinator_url: JString,
+    key: JString,
+) -> jstring {
+    let model = jstr(&mut env, &model_id);
+    let url = jstr(&mut env, &coordinator_url);
+    let key = jstr(&mut env, &key);
+    let ctx = context.max(512) as u64;
+    guarded(&mut env, move || {
+        api_cluster_plan_moe(&model, ctx, &url, &key)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_vibelocal_app_core_VibeLocalBridge_clusterCoordinatorStart(
+    mut env: JNIEnv,
+    _class: JClass,
+    addr: JString,
+    key: JString,
+    protect_artifacts: jboolean,
+    state_path: JString,
+) -> jstring {
+    let addr = jstr(&mut env, &addr);
+    let key = jstr(&mut env, &key);
+    let path = jstr(&mut env, &state_path);
+    let protect = protect_artifacts != 0;
+    guarded(&mut env, move || {
+        api_cluster_coordinator_start(&addr, &key, protect, &path)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_vibelocal_app_core_VibeLocalBridge_clusterCoordinatorStop(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    guarded(&mut env, api_cluster_coordinator_stop)
+}
+
+// ---------------------------------------------------------------------------
 // C-ABI exports (PC embedding / tests)
 // ---------------------------------------------------------------------------
 
@@ -592,6 +794,45 @@ mod tests {
         let status: Value = resp.into_json().unwrap();
         assert_eq!(status["ok"], true);
         let stopped = api_stop_server();
+        assert_eq!(stopped["ok"], true);
+    }
+
+    #[test]
+    fn cluster_coordinator_and_plan_via_api() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        temp_data_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let started = api_cluster_coordinator_start(
+            "127.0.0.1:0",
+            "",
+            false,
+            &dir.path().join("grid-state.gz").to_string_lossy(),
+        );
+        assert_eq!(started["ok"], true, "{started}");
+        let port = started["data"]["port"].as_u64().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        // Status through the grid proxy helper.
+        let status = api_cluster_status(&base, "");
+        assert_eq!(status["ok"], true, "{status}");
+        assert_eq!(status["data"]["health"]["status"], "ok");
+        // Solo MoE plan (no fleet nodes yet).
+        let plan = api_cluster_plan_moe("OLMoE", 4096, &base, "");
+        assert_eq!(plan["ok"], true, "{plan}");
+        assert_eq!(plan["data"]["routed_experts"], 64);
+        assert!(!plan["data"]["shards"].as_array().unwrap().is_empty());
+        // Agent join against the embedded coordinator.
+        let agent = api_cluster_agent_start(
+            &base,
+            "",
+            1,
+            "jni-test-agent",
+            &dir.path().to_string_lossy(),
+        );
+        assert_eq!(agent["ok"], true, "{agent}");
+        assert!(agent["data"]["node_id"].as_str().unwrap().starts_with('n'));
+        let stopped = api_cluster_agent_stop();
+        assert_eq!(stopped["ok"], true);
+        let stopped = api_cluster_coordinator_stop();
         assert_eq!(stopped["ok"], true);
     }
 }

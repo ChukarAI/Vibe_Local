@@ -488,6 +488,84 @@ fn route(
             ))
         }
         (Method::Get, "/catalog.json") => Ok(ok_json(catalog_payload(state)?)),
+        // --- Vibe Grid proxy (same-origin access to the :7900 coordinator) ---
+        (Method::Get, "/api/grid/state") => {
+            let base =
+                crate::grid_proxy::coordinator_base(query_param(url, "coordinator").as_deref());
+            let key = request_header(request, "X-Compost-Key");
+            Ok(ok_json(crate::grid_proxy::fetch_json(
+                &base,
+                "/api/v1/state",
+                key.as_deref(),
+            )?))
+        }
+        (Method::Get, "/api/grid/plan") => {
+            let base =
+                crate::grid_proxy::coordinator_base(query_param(url, "coordinator").as_deref());
+            let key = request_header(request, "X-Compost-Key");
+            let model =
+                query_param(url, "model_id").unwrap_or_else(|| "OLMoE-1B-7B-0924-Instruct".into());
+            let context: u64 = query_param(url, "context")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4096);
+            Ok(ok_json(crate::grid_proxy::plan_moe_live(
+                &model,
+                context,
+                &base,
+                key.as_deref(),
+            )?))
+        }
+        (Method::Get, p) if p.starts_with("/api/grid/tiles/") => {
+            let base =
+                crate::grid_proxy::coordinator_base(query_param(url, "coordinator").as_deref());
+            let key = request_header(request, "X-Compost-Key");
+            let job_id = p.trim_start_matches("/api/grid/tiles/");
+            Ok(ok_json(crate::grid_proxy::fetch_json(
+                &base,
+                &format!("/api/v1/jobs/{job_id}/tiles"),
+                key.as_deref(),
+            )?))
+        }
+        (Method::Get, p) if p.starts_with("/api/grid/artifact/") => {
+            let base =
+                crate::grid_proxy::coordinator_base(query_param(url, "coordinator").as_deref());
+            let key = request_header(request, "X-Compost-Key");
+            let job_id = p.trim_start_matches("/api/grid/artifact/");
+            let (bytes, ctype) = crate::grid_proxy::fetch_bytes(
+                &base,
+                &format!("/api/v1/jobs/{job_id}/artifact"),
+                key.as_deref(),
+            )?;
+            Ok(Response::from_data(bytes)
+                .with_status_code(200)
+                .with_header(header("Content-Type", &ctype))
+                .with_header(header("Content-Security-Policy", CSP)))
+        }
+        (Method::Post, "/api/grid/jobs") => {
+            let base =
+                crate::grid_proxy::coordinator_base(query_param(url, "coordinator").as_deref());
+            let key = request_header(request, "X-Compost-Key");
+            let body = read_body(request)?;
+            let value: serde_json::Value = serde_json::from_str(&body)?;
+            Ok(ok_json(crate::grid_proxy::post_json(
+                &base,
+                "/api/v1/jobs",
+                key.as_deref(),
+                value,
+            )?))
+        }
+        (Method::Post, p) if p.starts_with("/api/grid/cancel/") => {
+            let base =
+                crate::grid_proxy::coordinator_base(query_param(url, "coordinator").as_deref());
+            let key = request_header(request, "X-Compost-Key");
+            let job_id = p.trim_start_matches("/api/grid/cancel/");
+            Ok(ok_json(crate::grid_proxy::post_json(
+                &base,
+                &format!("/api/v1/jobs/{job_id}/cancel"),
+                key.as_deref(),
+                json!({}),
+            )?))
+        }
         (Method::Get, "/") | (Method::Get, "/leaderboard") => serve_static(state, "index.html"),
         (Method::Get, p) if !p.contains("..") => {
             let rel = p.trim_start_matches('/');

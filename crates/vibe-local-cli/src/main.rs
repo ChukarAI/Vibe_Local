@@ -83,6 +83,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Vibe Grid: distributed compute cluster + Wi-Fi MoE expert sharding
+    Cluster {
+        #[command(subcommand)]
+        cmd: vibe_local_cli::cluster_cli::ClusterCommand,
+    },
 }
 
 fn main() {
@@ -236,6 +241,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(3600));
             }
+        }
+        Command::Cluster { cmd } => {
+            vibe_local_cli::cluster_cli::run(cmd)?;
         }
         Command::Leaderboard {
             port,

@@ -205,4 +205,50 @@
     <string name="error_native_unavailable">Native engine unavailable and no HTTP fallback host configured.</string>
     <string name="error_http_unreachable">Could not reach %1$s. Is the Vibe-Link server running?</string>
     <string name="error_bad_response">Malformed response from the engine.</string>
+
+    <!-- Vibe Grid (Wi-Fi MoE & Cluster) -->
+    <string name="tab_grid">Vibe Grid</string>
+    <string name="grid_title">Vibe Grid — Wi-Fi MoE &amp; Cluster</string>
+    <string name="grid_subtitle">Distributed compute across phones + PCs. Sparse MoE experts shard over Wi-Fi; workers connect outward — no inbound ports.</string>
+    <string name="grid_connection">Coordinator connection</string>
+    <string name="grid_coordinator_url">Coordinator URL (http://pc-ip:7900)</string>
+    <string name="grid_fleet_key">Fleet key (X-Compost-Key)</string>
+    <string name="grid_connect">Connect</string>
+    <string name="grid_connected">Connected</string>
+    <string name="grid_disconnected">Coordinator unreachable</string>
+    <string name="grid_worker">This phone as worker</string>
+    <string name="grid_worker_help">Joins the fleet and pulls tasks outward over Wi-Fi. Battery &lt;30% and thermal guards pause work automatically; leases renew every 5s so throttled phones are never falsely reaped.</string>
+    <string name="grid_workers_label">Worker concurrency: %1$d</string>
+    <string name="grid_start_worker">Start worker</string>
+    <string name="grid_stop_worker">Stop worker</string>
+    <string name="grid_worker_running">Worker joined as %1$s</string>
+    <string name="grid_fleet">Fleet</string>
+    <string name="grid_no_nodes">No nodes have joined yet.</string>
+    <string name="grid_planner">MoE expert shard plan</string>
+    <string name="grid_model">Model</string>
+    <string name="grid_context">Context length</string>
+    <string name="grid_plan_button">Plan MoE</string>
+    <string name="grid_plan_summary">%1$d experts · top-%2$d per token · est %3$s tok/s · %4$s× vs single node</string>
+    <string name="grid_draft_nodes">Speculative draft nodes: %1$s</string>
+    <string name="grid_jobs">Jobs</string>
+    <string name="grid_no_jobs">No jobs yet.</string>
+    <string name="grid_cancel">Cancel</string>
+    <string name="grid_submit">Submit workload</string>
+    <string name="grid_kind">Kind</string>
+    <string name="grid_params">Params (KEY=value, space separated)</string>
+    <string name="grid_input_text">Input text</string>
+    <string name="grid_verify_mode">llm_batch verify mode (offline)</string>
+    <string name="grid_replicate">Replicate (2-node agreement)</string>
+    <string name="grid_priority">Priority: %1$d</string>
+    <string name="grid_submit_button">Submit job</string>
+    <string name="grid_coordinator_mode">Coordinator mode (advanced)</string>
+    <string name="grid_coordinator_help">Host the fleet brain on this device. Other phones and PCs join as workers.</string>
+    <string name="grid_show">Show</string>
+    <string name="grid_hide">Hide</string>
+    <string name="grid_listen_addr">Listen address</string>
+    <string name="grid_protect_artifacts">Protect artifacts (require fleet key)</string>
+    <string name="grid_start_coordinator">Start coordinator</string>
+    <string name="grid_stop_coordinator">Stop coordinator</string>
+    <string name="grid_coordinator_running">Coordinator listening on port %1$d</string>
+    <string name="grid_footer">Vibe Grid is wire-compatible with compost v0.7.0. Battery and thermal guards are enforced natively; the coordinator never dials into a phone.</string>
 </resources>

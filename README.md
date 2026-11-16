@@ -76,6 +76,55 @@ The native Kotlin + Jetpack Compose app lives in [`android/`](android/README.md)
 
 Build the native bridge with `cargo ndk` (see `android/README.md`). The phone becomes a token-authenticated LAN inference node that Vibe Router can dispatch to.
 
+## Vibe Grid — distributed compute + Wi-Fi MoE sharding
+
+Vibe Local is also a **pull-based distributed compute fleet** (`crates/vibe-local-cluster`),
+a native Rust port of **compost v0.7.0** — wire-compatible with the original
+Go protocol, so existing compost agents and dashboards keep working.
+
+```bash
+# PC: run the coordinator (fleet brain) on :7900
+vibe-local cluster coordinator --addr 0.0.0.0:7900 --key <secret> --state grid-state.gz
+
+# Any device (PC / phone / Termux): join as a worker — outward-only, NAT-friendly
+vibe-local cluster agent --coordinator http://<pc-ip>:7900 --key <secret> --workers 4
+
+# Submit workloads
+vibe-local cluster submit primes limit=10000000
+vibe-local cluster submit mandelbrot width=1920 height=1080 max_iter=1200 -o fractal.png
+vibe-local cluster submit llm_batch mode=verify --input prompts.txt   # uses Vibe Local :20129
+vibe-local cluster submit moe_distributed model_id=OLMoE-1B-7B-0924-Instruct
+
+# Fleet introspection
+vibe-local cluster status / nodes / jobs / cancel <job_id>
+
+# Partition a sparse MoE model across the live fleet (expert/RAM shard map)
+vibe-local cluster plan-moe OLMoE-1B-7B-0924-Instruct --context 4096
+```
+
+**Why MoE over Wi-Fi:** dense pipeline parallelism pays Wi-Fi latency on every
+layer; sparse MoE activates only top-k experts per token, so expert shards can
+live on different devices and only routed activations cross the network. The
+planner partitions experts proportional to `usable_ram_mb × speed_factor`:
+the coordinator hosts the shared backbone (embedding/attention/gating) plus
+the hottest experts, phones host contiguous expert ranges or act as
+speculative draft generators, and a dropped phone's shard re-routes to another
+node or pages into coordinator host RAM — without crashing the stream.
+
+All compost v0.7.0 hardening is preserved: constant-time `X-Compost-Key` auth,
+`--protect-artifacts` + 8-entry LRU, persistent `NodeUUID` (`.vibe-node-id` +
+hardware fingerprint) with Sybil-safe `--replicate` (distinct UUID **and** IP),
+two-pass fair + priority batch leasing with LPT ordering, compute-only
+`ExecMillis` + per-preset EWMA speed profiles (`prior_n=3.0`, `alpha=0.3`),
+monotonic `LeaseEpoch` + 5s active heartbeat renewal, post-assembly payload
+reclamation, battery (<30%) / thermal (>80°C CPU, >45°C Android battery)
+guards, gzip uploads >4KiB and a 9MiB gzip-bomb guard (HTTP 413).
+
+The **Vibe Grid** tab in the web dashboard (`/leaderboard`) and the Android app
+shows the fleet, guard badges, the expert shard allocation map and live
+job/tile progress. On the phone, the Vibe Grid tab joins the fleet as a worker
+(no inbound ports), plans MoE shards, and can even host the coordinator.
+
 ## The 10 independent benchmark pillars
 
 | # | Pillar | Measures |
@@ -120,13 +169,14 @@ python benchmarks/kaggle_10pillar_bench.py \
 ## Repository layout
 
 ```
-crates/vibe-local-core      Hardware probe, recommender, HF crawler, GGUF parser, catalog math, SQLite
+crates/vibe-local-core      Hardware probe (ghost-GPU-safe), recommender, HF crawler, GGUF parser, catalog math, SQLite
 crates/vibe-local-engine    llama-server supervisor, micro-eval engine, thermal governor, VibeMark
-crates/vibe-local-cli       vibe-local binary + Vibe-Link HTTP server + UDP/mDNS discovery
+crates/vibe-local-cli       vibe-local binary + Vibe-Link HTTP server + UDP/mDNS discovery + Vibe Grid proxy
+crates/vibe-local-cluster   Vibe Grid: compost v0.7.0 port (coordinator/agent/scheduler) + distributed MoE sharding
 crates/vibe-local-jni       Android JNI + C-ABI bridge (cdylib/staticlib)
-android/                    Kotlin + Compose Pocket Worker app (4 tabs, 4 safety guards)
+android/                    Kotlin + Compose Pocket Worker app (5 tabs, 4 safety guards, Vibe Grid worker)
 benchmarks/                 Kaggle 10-pillar runner + seed catalog (stdlib-only Python)
-leaderboard-web/            Vanilla-JS dashboard (Pareto scatter, degradation curves, matrix)
+leaderboard-web/            Vanilla-JS dashboard (Pareto scatter, degradation curves, matrix, Vibe Grid)
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, data flow and SQLite schema.

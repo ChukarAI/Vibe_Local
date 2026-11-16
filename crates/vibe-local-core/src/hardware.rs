@@ -365,7 +365,18 @@ fn windows_gpus() -> Vec<GpuInfo> {
     // and truncates >=4GB cards, so it is deliberately not used.
     let class_key =
         "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    // Ghost-GPU guard: the display class key keeps historical driver entries
+    // for cards that are no longer plugged in. Cross-check every subkey
+    // against the PnP devices that are physically present right now, and
+    // against adapters actively attached to the desktop.
+    let present = present_display_driver_subkeys();
+    let active_names = active_display_adapter_names();
     for sub in windows_registry_subkeys(class_key) {
+        if let Some(set) = &present
+            && !set.contains(&sub)
+        {
+            continue;
+        }
         let path = format!("{class_key}\\{sub}");
         let Some(name) = windows_registry_string(&path, "DriverDesc") else {
             continue;
@@ -385,6 +396,13 @@ fn windows_gpus() -> Vec<GpuInfo> {
         ]
         .iter()
         .any(|k| lower.contains(k))
+        {
+            continue;
+        }
+        // Present but not attached to the desktop (e.g. a disabled iGPU while
+        // a discrete card drives the display) is not an active inference GPU.
+        if let Some(active) = &active_names
+            && !active.contains(&lower)
         {
             continue;
         }
@@ -436,6 +454,162 @@ fn windows_lib_present(name: &str) -> bool {
         FreeLibrary(handle);
     }
     true
+}
+
+/// Display-device class GUID {4d36e968-e325-11ce-bfc1-08002be10318}.
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DevGuid {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+#[cfg(target_os = "windows")]
+const DISPLAY_CLASS_GUID: DevGuid = DevGuid {
+    data1: 0x4d36_e968,
+    data2: 0xe325,
+    data3: 0x11ce,
+    data4: [0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18],
+};
+
+/// Enumerate physically present display adapters via the PnP manager and
+/// return their display-class registry subkey names (the `Driver` property,
+/// e.g. "0001"). Returns None when setupapi is unavailable, in which case
+/// callers fall back to unfiltered registry enumeration.
+#[cfg(target_os = "windows")]
+fn present_display_driver_subkeys() -> Option<std::collections::HashSet<String>> {
+    use std::collections::HashSet;
+
+    #[repr(C)]
+    struct SpDevinfoData {
+        cb_size: u32,
+        class_guid: DevGuid,
+        dev_inst: u32,
+        reserved: usize,
+    }
+
+    const DIGCF_PRESENT: u32 = 0x0000_0002;
+    const SPDRP_DRIVER: u32 = 0x0000_0009;
+    const INVALID_HANDLE: isize = -1;
+
+    #[link(name = "setupapi")]
+    unsafe extern "system" {
+        fn SetupDiGetClassDevsW(
+            class_guid: *const DevGuid,
+            enumerator: *const u16,
+            parent: isize,
+            flags: u32,
+        ) -> isize;
+        fn SetupDiEnumDeviceInfo(set: isize, index: u32, info: *mut SpDevinfoData) -> i32;
+        fn SetupDiGetDeviceRegistryPropertyW(
+            set: isize,
+            info: *const SpDevinfoData,
+            property: u32,
+            reg_type: *mut u32,
+            buffer: *mut u8,
+            buffer_size: u32,
+            required: *mut u32,
+        ) -> i32;
+        fn SetupDiDestroyDeviceInfoList(set: isize) -> i32;
+    }
+
+    unsafe {
+        let set = SetupDiGetClassDevsW(&DISPLAY_CLASS_GUID, std::ptr::null(), 0, DIGCF_PRESENT);
+        if set == INVALID_HANDLE || set == 0 {
+            return None;
+        }
+        let mut out = HashSet::new();
+        for index in 0..256u32 {
+            let mut info: SpDevinfoData = std::mem::zeroed();
+            info.cb_size = std::mem::size_of::<SpDevinfoData>() as u32;
+            if SetupDiEnumDeviceInfo(set, index, &mut info) == 0 {
+                break;
+            }
+            let mut buf = [0u8; 512];
+            let mut required = 0u32;
+            let ok = SetupDiGetDeviceRegistryPropertyW(
+                set,
+                &info,
+                SPDRP_DRIVER,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut required,
+            );
+            if ok == 0 || required == 0 {
+                continue;
+            }
+            let units: Vec<u16> = buf[..required as usize]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
+                .take_while(|&u| u != 0)
+                .collect();
+            if let Ok(driver) = String::from_utf16(&units) {
+                // SPDRP_DRIVER is "{class-guid}\000x" — keep the subkey part.
+                let subkey = driver.rsplit('\\').next().unwrap_or("").trim().to_string();
+                if !subkey.is_empty() {
+                    out.insert(subkey);
+                }
+            }
+        }
+        SetupDiDestroyDeviceInfoList(set);
+        Some(out)
+    }
+}
+
+/// Adapter names (lowercased) that EnumDisplayDevicesW reports as ACTIVE
+/// (attached to the desktop right now). None when enumeration fails.
+#[cfg(target_os = "windows")]
+fn active_display_adapter_names() -> Option<std::collections::HashSet<String>> {
+    use std::collections::HashSet;
+
+    #[repr(C)]
+    struct DisplayDeviceW {
+        cb: u32,
+        device_name: [u16; 32],
+        device_string: [u16; 128],
+        state_flags: u32,
+        device_id: [u16; 128],
+        device_key: [u16; 128],
+    }
+
+    const DISPLAY_DEVICE_ACTIVE: u32 = 0x0000_0001;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumDisplayDevicesW(
+            device: *const u16,
+            dev_num: u32,
+            display_device: *mut DisplayDeviceW,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let mut out = HashSet::new();
+    for i in 0..64u32 {
+        let mut dd: DisplayDeviceW = unsafe { std::mem::zeroed() };
+        dd.cb = std::mem::size_of::<DisplayDeviceW>() as u32;
+        let ok = unsafe { EnumDisplayDevicesW(std::ptr::null(), i, &mut dd, 0) };
+        if ok == 0 {
+            break;
+        }
+        if dd.state_flags & DISPLAY_DEVICE_ACTIVE == 0 {
+            continue;
+        }
+        let name: String = String::from_utf16_lossy(&dd.device_string)
+            .trim_end_matches('\0')
+            .trim()
+            .to_lowercase();
+        if !name.is_empty() {
+            out.insert(name);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1022,5 +1196,21 @@ mod tests {
         unsafe { std::env::remove_var("VIBE_PORTABLE_ROOT") };
         assert!(info.available);
         assert!(info.root.unwrap().ends_with("portable_data"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn pnp_presence_enumeration_works() {
+        let present = present_display_driver_subkeys();
+        assert!(present.is_some(), "setupapi must enumerate present devices");
+        let set = present.unwrap();
+        assert!(
+            !set.is_empty(),
+            "this machine has at least one display adapter"
+        );
+        // Every reported GPU must correspond to a present PnP devnode.
+        for gpu in windows_gpus() {
+            assert!(!gpu.name.is_empty());
+        }
     }
 }
