@@ -37,6 +37,12 @@ object SafeBridge {
     fun chat(prompt: String, stripThink: Boolean): BridgeResult =
         invoke { VibeLocalBridge.chat(prompt, stripThink) }
 
+    fun loadModel(configJson: String): BridgeResult =
+        invoke { VibeLocalBridge.loadModel(configJson) }
+
+    fun chatMessages(messagesJson: String, stripThink: Boolean): BridgeResult =
+        invoke { VibeLocalBridge.chatMessages(messagesJson, stripThink) }
+
     fun unloadModel(): BridgeResult = invoke { VibeLocalBridge.unloadModel() }
 
     fun setThermalReading(celsius: Double): BridgeResult =

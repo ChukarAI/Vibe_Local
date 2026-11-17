@@ -85,8 +85,20 @@ fn linux_thermal_c() -> Option<f64> {
 
 #[cfg(target_os = "windows")]
 fn windows_thermal_c() -> Option<f64> {
-    // ACPI thermal zones via WMI (tenths of Kelvin). Many desktops do not
-    // expose this class; in that case we honestly report no sensor.
+    static WMI_UNAVAILABLE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    wmi_probe_cached(&WMI_UNAVAILABLE)
+}
+
+/// ACPI thermal zones via WMI (tenths of Kelvin). Many desktops do not
+/// expose this class and PowerShell costs 300-800ms per spawn, so a failed
+/// or empty first probe marks WMI unavailable for the rest of the session
+/// (NoSensor) instead of re-spawning PowerShell on every poll.
+#[cfg(target_os = "windows")]
+fn wmi_probe_cached(unavailable: &std::sync::atomic::AtomicBool) -> Option<f64> {
+    if unavailable.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     let out = run_with_timeout(
         "powershell.exe",
         &[
@@ -96,12 +108,15 @@ fn windows_thermal_c() -> Option<f64> {
             "(Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue | Select-Object -First 1).CurrentTemperature",
         ],
         Duration::from_secs(8),
-    )?;
-    let tenth_kelvin: f64 = out.trim().parse().ok()?;
-    if tenth_kelvin <= 0.0 {
-        return None;
+    );
+    let parsed = out.and_then(|s| s.trim().parse::<f64>().ok());
+    match parsed {
+        Some(tenth_kelvin) if tenth_kelvin > 0.0 => Some((tenth_kelvin - 2732.0) / 10.0),
+        _ => {
+            unavailable.store(true, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
     }
-    Some((tenth_kelvin - 2732.0) / 10.0)
 }
 
 #[cfg(target_os = "macos")]
@@ -244,5 +259,27 @@ mod tests {
         g.set_override(41.5);
         assert_eq!(g.current_reading(), Some(41.5));
         g.clear_override();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn wmi_failure_cached_for_session() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // A pre-marked unavailable flag must short-circuit without spawning
+        // PowerShell (returns instantly).
+        let flag = AtomicBool::new(true);
+        let start = std::time::Instant::now();
+        assert_eq!(wmi_probe_cached(&flag), None);
+        assert!(start.elapsed() < Duration::from_millis(100));
+        // A fresh probe either finds a sensor or marks the flag; a second
+        // probe after failure must be instant.
+        let fresh = AtomicBool::new(false);
+        let first = wmi_probe_cached(&fresh);
+        if first.is_none() {
+            assert!(fresh.load(Ordering::Relaxed));
+            let start = std::time::Instant::now();
+            assert_eq!(wmi_probe_cached(&fresh), None);
+            assert!(start.elapsed() < Duration::from_millis(100));
+        }
     }
 }

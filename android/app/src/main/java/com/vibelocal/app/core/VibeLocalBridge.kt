@@ -42,6 +42,13 @@ object VibeLocalBridge {
 
     external fun chat(prompt: String, stripThink: Boolean): String
 
+    /** LoadRequest JSON: path required; ctx 0/omitted auto-sizes; optional
+     *  draft_model_path / draft_ngl / draft_max for speculative decoding. */
+    external fun loadModel(configJson: String): String
+
+    /** JSON array of OpenAI-style {"role","content"} messages (multi-turn). */
+    external fun chatMessages(messagesJson: String, stripThink: Boolean): String
+
     external fun unloadModel(): String
 
     external fun setThermalReading(celsius: Double): String

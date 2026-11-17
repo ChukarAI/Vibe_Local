@@ -104,6 +104,8 @@ pub fn detect() -> Caps {
         version: VERSION.to_string(),
         has_local_llm: false,
         local_llm_models: Vec::new(),
+        capabilities: Vec::new(),
+        loaded_models: Vec::new(),
     };
     if let Some((pct, charging)) = battery() {
         caps.battery_pct = pct;
@@ -114,7 +116,11 @@ pub fn detect() -> Caps {
     }
     let (has, models) = probe_local_llm();
     caps.has_local_llm = has;
-    caps.local_llm_models = models;
+    caps.local_llm_models = models.clone();
+    caps.loaded_models = models;
+    if has {
+        caps.capabilities.push("llm".to_string());
+    }
     caps
 }
 

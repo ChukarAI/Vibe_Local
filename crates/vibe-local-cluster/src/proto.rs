@@ -93,7 +93,26 @@ pub struct Caps {
     pub has_local_llm: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_llm_models: Vec<String>,
+    /// Task specializations this node can serve: "llm", "vision", "stt",
+    /// "tts", "image_gen", "video_gen", "embed_rag". Empty = general compute
+    /// (compost v0.7.0 agents that predate capability routing).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// Models currently resident on this node (advertised, not verified).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded_models: Vec<String>,
 }
+
+/// Known capability labels for heterogeneous task routing.
+pub const CAPABILITIES: [&str; 7] = [
+    "llm",
+    "vision",
+    "stt",
+    "tts",
+    "image_gen",
+    "video_gen",
+    "embed_rag",
+];
 
 /// Node is a registered device as seen by the coordinator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,6 +318,9 @@ pub struct Job {
     pub meta: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "b64")]
     pub input: Option<Vec<u8>>,
+    /// Only lease this job's tasks to nodes advertising this capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_capability: Option<String>,
 }
 
 /// SubmitJobRequest accepts numeric params plus string options (mode/model/
@@ -318,6 +340,8 @@ pub struct SubmitJobRequest {
     pub replicate: bool,
     #[serde(skip_serializing_if = "is_zero_i32")]
     pub priority: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_capability: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for SubmitJobRequest {
@@ -337,6 +361,8 @@ impl<'de> Deserialize<'de> for SubmitJobRequest {
             replicate: bool,
             #[serde(default)]
             priority: i32,
+            #[serde(default)]
+            required_capability: Option<String>,
         }
         let raw = Raw::deserialize(d)?;
         let mut out = SubmitJobRequest {
@@ -347,6 +373,7 @@ impl<'de> Deserialize<'de> for SubmitJobRequest {
             input: raw.input,
             replicate: raw.replicate,
             priority: raw.priority,
+            required_capability: raw.required_capability,
         };
         for (k, v) in raw.params {
             match v {
@@ -439,6 +466,46 @@ mod tests {
         let bad: Result<SubmitJobRequest, _> =
             serde_json::from_str(r#"{"kind":"x","params":{"a":true}}"#);
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn caps_backward_compat_and_capability_roundtrip() {
+        // compost v0.7.0 agents send no capabilities/loaded_models fields.
+        let legacy: Caps = serde_json::from_str(
+            r#"{"cores":4,"mem_mb":8192,"score":1.0,"battery_pct":-1,"on_battery":false,"temp_c":-1,"arch":"x86_64","os":"linux","version":"0.7.0"}"#,
+        )
+        .unwrap();
+        assert!(legacy.capabilities.is_empty());
+        assert!(legacy.loaded_models.is_empty());
+        assert!(
+            !serde_json::to_string(&legacy)
+                .unwrap()
+                .contains("capabilities")
+        );
+        let mut c = legacy.clone();
+        c.capabilities = vec!["llm".into(), "vision".into()];
+        c.loaded_models = vec!["qwen2.5-7b".into()];
+        let back: Caps = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn submit_required_capability_roundtrip() {
+        let req: SubmitJobRequest =
+            serde_json::from_str(r#"{"kind":"llm_batch","required_capability":"llm"}"#).unwrap();
+        assert_eq!(req.required_capability.as_deref(), Some("llm"));
+        assert!(
+            serde_json::to_string(&req)
+                .unwrap()
+                .contains("\"required_capability\":\"llm\"")
+        );
+        let none: SubmitJobRequest = serde_json::from_str(r#"{"kind":"primes"}"#).unwrap();
+        assert!(none.required_capability.is_none());
+        assert!(
+            !serde_json::to_string(&none)
+                .unwrap()
+                .contains("required_capability")
+        );
     }
 
     #[test]

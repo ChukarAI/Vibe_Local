@@ -13,6 +13,6 @@ pub mod thermal;
 pub mod vibemark;
 
 pub use microeval::{MicroEval, strip_think};
-pub use supervisor::{ChatReply, Engine, EngineConfig, EngineStatus, LoadRequest};
+pub use supervisor::{ChatMessage, ChatReply, Engine, EngineConfig, EngineStatus, LoadRequest};
 pub use thermal::{ThermalGovernor, ThermalState};
 pub use vibemark::VibeMarkResult;

@@ -16,6 +16,7 @@
 
 pub mod agent;
 pub mod auth;
+pub mod grid_discovery;
 pub mod metrics;
 pub mod moe_grid;
 pub mod node;

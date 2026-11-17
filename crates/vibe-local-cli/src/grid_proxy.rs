@@ -172,6 +172,13 @@ pub fn status_combined(base: &str, key: Option<&str>) -> anyhow::Result<serde_js
     Ok(json!({"health": health, "state": state}))
 }
 
+/// Capability directory for Vibe Router (:20128): online fleet nodes grouped
+/// by advertised capability, with LAN endpoints, speed factors, guard state
+/// and loaded models.
+pub fn capabilities_directory(base: &str, key: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    fetch_json(base, "/api/v1/capabilities", key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

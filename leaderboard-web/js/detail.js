@@ -141,7 +141,7 @@ export function createDetailDrawer(root) {
         kvCard('Decode', fmt.tps(tp.decode_tps) + ' t/s', 'cyan'),
         kvCard('TTFT', fmt.ms(tp.ttft_ms)),
         kvCard('Peak RAM', fmt.mb(tp.peak_ram_mb)),
-        kvCard('Peak VRAM', tp.peak_vram_mb ? fmt.mb(tp.peak_vram_mb) : 'n/a (CPU)'),
+        kvCard('Peak VRAM', tp.peak_vram_mb != null ? fmt.mb(tp.peak_vram_mb) : 'not measured'),
         kvCard('Thermal Δ', fmt.celsius(tp.thermal_delta_c), 'amber'))));
 
     // pillars

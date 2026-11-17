@@ -338,11 +338,13 @@ impl Db {
             let entry: CatalogEntry = serde_json::from_str(&row?)?;
             entries.push(entry.with_derived());
         }
-        // Measured/submitted entries supersede seed estimates for the same
-        // (model, quant, profile) key: sort best-provenance first, then dedup.
+        // Higher-trust entries supersede lower-trust ones for the same
+        // (model, quant, profile) key: measured > submitted > throughput_only
+        // > seed_estimate. Sort best-provenance first, then dedup.
         let rank = |p: &str| match p {
-            "measured" => 2,
-            "submitted" => 1,
+            "measured" => 3,
+            "submitted" => 2,
+            "throughput_only" => 1,
             _ => 0,
         };
         entries.sort_by(|a, b| {
@@ -546,6 +548,41 @@ mod tests {
         // profile filter
         assert_eq!(db.leaderboard("tesla_t4").unwrap().len(), 0);
         assert_eq!(db.leaderboard("").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn leaderboard_full_provenance_precedence() {
+        let db = Db::open_in_memory().unwrap();
+        // Insert worst-first and best-first orders; dedup must always keep
+        // measured > submitted > throughput_only > seed_estimate.
+        for prov in ["seed_estimate", "throughput_only", "submitted", "measured"] {
+            db.upsert_catalog_entry(&test_entry("A", prov)).unwrap();
+        }
+        for prov in ["measured", "submitted", "throughput_only", "seed_estimate"] {
+            db.upsert_catalog_entry(&test_entry("B", prov)).unwrap();
+        }
+        db.upsert_catalog_entry(&test_entry("C", "throughput_only"))
+            .unwrap();
+        db.upsert_catalog_entry(&test_entry("C", "seed_estimate"))
+            .unwrap();
+        db.upsert_catalog_entry(&test_entry("D", "submitted"))
+            .unwrap();
+        db.upsert_catalog_entry(&test_entry("D", "throughput_only"))
+            .unwrap();
+        let board = db.leaderboard("").unwrap();
+        assert_eq!(board.len(), 4);
+        let prov = |m: &str| {
+            board
+                .iter()
+                .find(|e| e.model_id == m)
+                .unwrap()
+                .provenance
+                .clone()
+        };
+        assert_eq!(prov("A"), "measured");
+        assert_eq!(prov("B"), "measured");
+        assert_eq!(prov("C"), "throughput_only");
+        assert_eq!(prov("D"), "submitted");
     }
 
     #[test]

@@ -75,7 +75,10 @@ pub fn bench(
         path: path.to_string_lossy().into_owned(),
         backend: backend.clone(),
         ngl,
-        ctx: 4096,
+        ctx: 0, // GGUF-aware auto-context (512MB safety margin)
+        draft_model_path: None,
+        draft_ngl: None,
+        draft_max: None,
     })?;
     let result = engine.vibemark(budget_secs)?;
     engine.unload();
@@ -231,7 +234,9 @@ fn build_bench_entry(
         size_bytes: info.file_size_bytes,
         context_length: info.context_length.unwrap_or(4096),
         hardware_profile: profile.into(),
-        provenance: "measured".into(),
+        // CLI bench measures throughput/latency only; quality pillars are
+        // inherited seed estimates, so the entry is never labeled "measured".
+        provenance: "throughput_only".into(),
         source_url: String::new(),
         pillars,
         throughput: Throughput {
@@ -239,8 +244,8 @@ fn build_bench_entry(
             decode_tps: result.decode_tps,
             ttft_ms: result.ttft_ms,
             peak_ram_mb: result.peak_ram_mb,
-            peak_vram_mb: 0.0,
-            thermal_delta_c: 0.0,
+            peak_vram_mb: None,
+            thermal_delta_c: None,
         },
         vibe_quality_score: None,
         power_per_parameter: None,
@@ -450,10 +455,11 @@ pub fn print_leaderboard(value: &serde_json::Value) {
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
+    if s.chars().count() <= n {
         s.to_string()
     } else {
-        format!("{}…", &s[..n - 1])
+        let t: String = s.chars().take(n.saturating_sub(1)).collect();
+        format!("{t}…")
     }
 }
 
@@ -554,9 +560,26 @@ mod tests {
         let entry = build_bench_entry(&info, &result, &hw, &db).unwrap();
         entry.validate().unwrap();
         assert_eq!(entry.hardware_profile, "rx580_vulkan");
-        assert_eq!(entry.provenance, "measured");
+        assert_eq!(entry.provenance, "throughput_only");
+        assert!(entry.throughput.peak_vram_mb.is_none());
+        assert!(entry.throughput.thermal_delta_c.is_none());
+        let json = serde_json::to_value(&entry).unwrap();
+        assert!(json["throughput"]["peak_vram_mb"].is_null());
+        assert!(json["throughput"]["thermal_delta_c"].is_null());
         assert!(entry.pillars.contains_key("hardware_throughput"));
         assert!(entry.pillars.contains_key("latency_thermal_efficiency"));
         assert!(entry.vibe_quality_score.is_some());
+    }
+
+    #[test]
+    fn truncate_multibyte_safe() {
+        assert_eq!(truncate("short", 40), "short");
+        assert_eq!(truncate("abcdefghijklmnopqrstuvwxyz", 10), "abcdefghi…");
+        // Multi-byte chars: byte slicing would panic here.
+        assert_eq!(truncate("模型名称测试abcdefgh", 6), "模型名称测…");
+        assert_eq!(truncate("🦀🦀🦀🦀🦀", 3), "🦀🦀…");
+        assert_eq!(truncate("éééé", 2), "é…");
+        assert_eq!(truncate("abc", 0), "…");
+        assert_eq!(truncate("", 5), "");
     }
 }

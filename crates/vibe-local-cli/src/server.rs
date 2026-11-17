@@ -20,7 +20,9 @@ use vibe_local_engine::{Engine, LoadRequest};
 
 pub const DEFAULT_PORT: u16 = 20129;
 const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
-const WORKER_THREADS: usize = 4;
+// 8 workers so slow routes (vibemark, discover, chat) cannot starve the
+// fast /api/status and /api/hardware probes Vibe Router polls.
+const WORKER_THREADS: usize = 8;
 
 const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
@@ -81,6 +83,8 @@ pub fn start_server(config: ServerConfig) -> anyhow::Result<Arc<ServerHandle>> {
     let state = Arc::new(AppState {
         config: config.clone(),
         stop: Arc::clone(&stop),
+        vibemark_running: AtomicBool::new(false),
+        prewarm_running: Arc::new(AtomicBool::new(false)),
     });
     let mut workers = Vec::new();
     for i in 0..WORKER_THREADS {
@@ -110,6 +114,8 @@ pub fn start_server(config: ServerConfig) -> anyhow::Result<Arc<ServerHandle>> {
 struct AppState {
     config: ServerConfig,
     stop: Arc<AtomicBool>,
+    vibemark_running: AtomicBool,
+    prewarm_running: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -320,7 +326,8 @@ fn route(
                     "seed_estimate entries cannot be submitted via the API",
                 ));
             }
-            if entry.provenance != "measured" {
+            // Keep honest partial-run labels; anything else is a submission.
+            if entry.provenance != "measured" && entry.provenance != "throughput_only" {
                 entry.provenance = "submitted".into();
             }
             entry.validate()?;
@@ -366,6 +373,7 @@ fn route(
             state.config.engine.load(req)?;
             Ok(ok_json(json!({"ok": true})))
         }
+        (Method::Post, "/api/prewarm") => prewarm_route(request, state),
         (Method::Post, "/api/unload") => {
             state.config.engine.unload();
             Ok(ok_json(json!({"ok": true})))
@@ -387,37 +395,18 @@ fn route(
             Ok(ok_json(json!({"ok": true})))
         }
         (Method::Post, "/api/vibemark") => {
-            let body = read_body(request)?;
-            let value: serde_json::Value = if body.trim().is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&body)?
-            };
-            if let Some(path) = value["path"].as_str() {
-                let status = state.config.engine.status()?;
-                if status.loaded_model.as_deref() != Some(path) {
-                    state.config.engine.load(LoadRequest {
-                        path: path.to_string(),
-                        backend: value["backend"].as_str().unwrap_or("cpu").to_string(),
-                        ngl: value["ngl"].as_u64().unwrap_or(0) as u32,
-                        ctx: value["ctx"].as_u64().unwrap_or(4096) as u32,
-                    })?;
-                }
+            // Only one benchmark at a time: a second request gets 409
+            // immediately instead of occupying another worker thread.
+            if state
+                .vibemark_running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return Ok(err_json(409, "a VibeMark run is already in progress"));
             }
-            let budget = value["budget_secs"].as_u64().unwrap_or(15);
-            let result = state.config.engine.vibemark(budget)?;
-            let db = state.config.db.lock().unwrap();
-            db.insert_vibemark(
-                &result.model,
-                &result.backend,
-                &result.engine,
-                result.prefill_tps,
-                result.decode_tps,
-                result.ttft_ms,
-                result.peak_ram_mb,
-                result.duration_s,
-            )?;
-            Ok(ok_json(serde_json::to_value(&result)?))
+            let result = vibemark_route(request, state);
+            state.vibemark_running.store(false, Ordering::SeqCst);
+            result
         }
         (Method::Get, "/api/vibemark/latest") => {
             let db = state.config.db.lock().unwrap();
@@ -496,6 +485,15 @@ fn route(
             Ok(ok_json(crate::grid_proxy::fetch_json(
                 &base,
                 "/api/v1/state",
+                key.as_deref(),
+            )?))
+        }
+        (Method::Get, "/api/grid/capabilities") => {
+            let base =
+                crate::grid_proxy::coordinator_base(query_param(url, "coordinator").as_deref());
+            let key = request_header(request, "X-Compost-Key");
+            Ok(ok_json(crate::grid_proxy::capabilities_directory(
+                &base,
                 key.as_deref(),
             )?))
         }
@@ -580,6 +578,101 @@ fn route(
 
 trait ThroughputBackend {
     fn thr_throughput_backend(&self) -> String;
+}
+
+/// Body of POST /api/vibemark, split out so the 409 concurrency guard can
+/// reset its flag on every exit path (including errors).
+fn vibemark_route(request: &mut Request, state: &AppState) -> HttpResult {
+    let body = read_body(request)?;
+    let value: serde_json::Value = if body.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&body)?
+    };
+    if let Some(path) = value["path"].as_str() {
+        let status = state.config.engine.status()?;
+        if status.loaded_model.as_deref() != Some(path) {
+            state.config.engine.load(LoadRequest {
+                path: path.to_string(),
+                backend: value["backend"].as_str().unwrap_or("cpu").to_string(),
+                ngl: value["ngl"].as_u64().unwrap_or(0) as u32,
+                ctx: value["ctx"].as_u64().unwrap_or(0) as u32,
+                draft_model_path: value["draft_model_path"].as_str().map(String::from),
+                draft_ngl: value["draft_ngl"].as_i64().map(|v| v as i32),
+                draft_max: value["draft_max"].as_u64().map(|v| v as u32),
+            })?;
+        }
+    }
+    let budget = value["budget_secs"].as_u64().unwrap_or(15);
+    let result = state.config.engine.vibemark(budget)?;
+    let db = state.config.db.lock().unwrap();
+    db.insert_vibemark(
+        &result.model,
+        &result.backend,
+        &result.engine,
+        result.prefill_tps,
+        result.decode_tps,
+        result.ttft_ms,
+        result.peak_ram_mb,
+        result.duration_s,
+    )?;
+    Ok(ok_json(serde_json::to_value(&result)?))
+}
+
+/// POST /api/prewarm: start loading a model in the background so Vibe Router
+/// / Vibe Assembly can hide cold-start latency behind planner reasoning.
+/// 202 when a load starts, 200 when the model is already resident, 409 when
+/// another prewarm is still in flight.
+fn prewarm_route(request: &mut Request, state: &AppState) -> HttpResult {
+    let body = read_body(request)?;
+    let value: serde_json::Value = serde_json::from_str(&body)?;
+    let Some(path) = value["path"].as_str() else {
+        return Ok(err_json(400, "path is required"));
+    };
+    // Claim the slot before touching the engine: status() queues behind any
+    // running benchmark, so checking it first would shrink the 409 window.
+    if state
+        .prewarm_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(err_json(409, "a prewarm load is already in progress"));
+    }
+    let status = match state.config.engine.status() {
+        Ok(s) => s,
+        Err(e) => {
+            state.prewarm_running.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+    };
+    if status.loaded_model.as_deref() == Some(path) {
+        state.prewarm_running.store(false, Ordering::SeqCst);
+        return Ok(ok_json(json!({"ok": true, "state": "already_loaded"})));
+    }
+    let req = LoadRequest {
+        path: path.to_string(),
+        backend: value["backend"].as_str().unwrap_or("cpu").to_string(),
+        ngl: value["ngl"].as_u64().unwrap_or(0) as u32,
+        ctx: value["ctx"].as_u64().unwrap_or(0) as u32,
+        draft_model_path: value["draft_model_path"].as_str().map(String::from),
+        draft_ngl: value["draft_ngl"].as_i64().map(|v| v as i32),
+        draft_max: value["draft_max"].as_u64().map(|v| v as u32),
+    };
+    let engine = Arc::clone(&state.config.engine);
+    let flag = Arc::clone(&state.prewarm_running);
+    std::thread::Builder::new()
+        .name("vibe-prewarm".into())
+        .spawn(move || {
+            if let Err(e) = engine.load(req) {
+                eprintln!("[vibe-prewarm] load failed: {e:#}");
+            }
+            flag.store(false, Ordering::SeqCst);
+        })?;
+    Ok(json_response(
+        202,
+        json!({"ok": true, "state": "loading"}),
+        &[],
+    ))
 }
 
 impl ThroughputBackend for CatalogEntry {
@@ -865,6 +958,113 @@ mod tests {
             .send_string("")
             .unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[test]
+    fn prewarm_and_vibemark_concurrency_guards() {
+        let (_h, base) = test_state(false, None);
+        if vibe_local_engine::supervisor::find_llama_server(None).is_some() {
+            return; // synthetic GGUFs only load in builtin mode
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for name in ["a-Q4_K_M.gguf", "b-Q4_K_M.gguf"] {
+            let path = dir.path().join(name);
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&vibe_local_core::gguf::GGUF_MAGIC.to_le_bytes());
+            bytes.extend_from_slice(&3u32.to_le_bytes());
+            bytes.extend_from_slice(&0u64.to_le_bytes());
+            bytes.extend_from_slice(&1u64.to_le_bytes());
+            let key = b"general.architecture";
+            bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(key);
+            bytes.extend_from_slice(&8u32.to_le_bytes());
+            let val = b"llama";
+            bytes.extend_from_slice(&(val.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(val);
+            std::fs::write(&path, bytes).unwrap();
+            paths.push(path.to_string_lossy().into_owned());
+        }
+        // Reduce ureq results to (status, body) so thread closures never
+        // return the large ureq::Error variant.
+        fn post_status(
+            url: String,
+            body: serde_json::Value,
+            secs: u64,
+        ) -> (u16, serde_json::Value) {
+            let result = ureq::post(&url)
+                .set("Content-Type", "application/json")
+                .timeout(Duration::from_secs(secs))
+                .send_json(body);
+            let resp = match result {
+                Ok(resp) => resp,
+                Err(ureq::Error::Status(_, resp)) => resp,
+                Err(e) => panic!("request to {url} failed: {e}"),
+            };
+            let code = resp.status();
+            (code, resp.into_json().unwrap_or(json!({})))
+        }
+        let post_json =
+            |path: &str, body: serde_json::Value| post_status(format!("{base}{path}"), body, 30);
+        // path is required.
+        assert_eq!(post_json("/api/prewarm", json!({})).0, 400);
+        // Hold the engine worker with a VibeMark run (~6s builtin budget).
+        let base2 = base.clone();
+        let pa = paths[0].clone();
+        let mark = std::thread::spawn(move || {
+            post_status(
+                format!("{base2}/api/vibemark"),
+                json!({"path": pa, "budget_secs": 6}),
+                60,
+            )
+            .0
+        });
+        std::thread::sleep(Duration::from_millis(1000));
+        // Concurrent VibeMark -> 409.
+        assert_eq!(post_json("/api/vibemark", json!({})).0, 409);
+        // Prewarm a different model while the engine is busy: both requests
+        // race for the prewarm slot; one wins (202 queued), the other gets 409.
+        let mut prewarms = Vec::new();
+        for _ in 0..2 {
+            let base3 = base.clone();
+            let pb = paths[1].clone();
+            prewarms.push(std::thread::spawn(move || {
+                post_status(format!("{base3}/api/prewarm"), json!({"path": pb}), 30)
+            }));
+        }
+        let results: Vec<_> = prewarms.into_iter().map(|h| h.join().unwrap()).collect();
+        let mut accepted = 0;
+        let mut rejected = 0;
+        for (code, v) in results {
+            match code {
+                202 => {
+                    assert_eq!(v["state"], "loading");
+                    accepted += 1;
+                }
+                409 => rejected += 1,
+                other => panic!("unexpected prewarm status {other}: {v}"),
+            }
+        }
+        assert_eq!(accepted, 1, "expected exactly one 202");
+        assert_eq!(rejected, 1, "expected exactly one 409");
+        // First VibeMark completes normally.
+        assert_eq!(mark.join().unwrap(), 200);
+        // Background prewarm settles; repeating it reports already_loaded.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let st: serde_json::Value = get(&format!("{base}/api/status")).into_json().unwrap();
+            if st["loaded_model"].as_str() == Some(paths[1].as_str()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "prewarm never settled"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let (code, v) = post_json("/api/prewarm", json!({"path": paths[1]}));
+        assert_eq!(code, 200);
+        assert_eq!(v["state"], "already_loaded");
     }
 
     #[test]

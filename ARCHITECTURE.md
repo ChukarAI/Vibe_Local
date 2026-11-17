@@ -33,7 +33,7 @@ This document describes the system design of Vibe Local: a zero-cloud local infe
                  ▲
                  │ System.loadLibrary("vibe_local_jni")
    ┌─────────────┴──────────────────┐
-   │  android/ (Kotlin + Compose)   │   4 tabs · 4 safety guards
+   │  android/ (Kotlin + Compose)   │   5 tabs · 4 safety guards
    └────────────────────────────────┘
 
    benchmarks/kaggle_10pillar_bench.py ──▶ SQLite (same schema) + POST /api/leaderboard/submit
@@ -92,7 +92,7 @@ RAM calculator at 2k/4k/8k/16k: `weights(file size) + KV(2·layers·ctx·kv_head
 - 10 pillar IDs; `vibe_quality_score` = weighted mean of the 8 quality pillars (weights .16/.12/.14/.10/.12/.12/.12/.12, sum 1.0).
 - `power_per_parameter = vibe_quality_score / active_params_b`.
 - Pareto frontier: minimize active params, maximize quality (strict dominance).
-- `CatalogEntry::validate()` enforces ranges, family, provenance enum and HF-only download URLs — applied on every API submission and DB upsert.
+- `CatalogEntry::validate()` enforces ranges, family, provenance enum (`seed_estimate` / `throughput_only` / `submitted` / `measured`) and HF-only download URLs — applied on every API submission and DB upsert. `Throughput.peak_vram_mb` and `thermal_delta_c` are `Option<f64>`: `null` when the platform exposes no VRAM/thermal sensor, never a fabricated number.
 
 ### 2.6 Unified SQLite (`db.rs`)
 
@@ -108,7 +108,7 @@ catalog_entries(id, model_id, quant, hardware_profile, provenance, entry_json, u
 settings(key, value)
 ```
 
-`busy_timeout = 5000`, `journal_mode = WAL` on disk, `synchronous = NORMAL`, single-owner access via `Arc<Mutex<Db>>`. Leaderboard assembly deduplicates by (model, quant, profile) keeping the best provenance: **measured > submitted > seed_estimate**.
+`busy_timeout = 5000`, `journal_mode = WAL` on disk, `synchronous = NORMAL`, single-owner access via `Arc<Mutex<Db>>`. Leaderboard assembly deduplicates by (model, quant, profile) keeping the best provenance: **measured > submitted > throughput_only > seed_estimate**.
 
 ## 3. Engine crate (`vibe-local-engine`)
 
@@ -116,9 +116,11 @@ settings(key, value)
 
 - One worker thread owns all state; commands arrive over a **bounded `sync_channel(16)`**; replies use bounded `sync_channel(1)` with timeouts.
 - `Load`: validates the GGUF header, then spawns `llama-server -m … --host 127.0.0.1 --port 20130 -ngl N -c CTX -np 1` with backend env (`CUDA_VISIBLE_DEVICES` / `GGML_VK_DEVICE`), polls `/health` up to 150s, kills the child on failure. Binary resolution: explicit > `VIBE_LLAMA_SERVER` > `PATH` > `./llama.cpp/build/bin`.
+- **Auto-context**: `LoadRequest.ctx == 0` picks the largest GGUF-estimated window (2k/4k/8k/16k, capped at the trained `context_length`) whose RAM estimate fits live free VRAM (when offloading) or free RAM, minus `CTX_SAFETY_MARGIN_MB = 512`. Nothing fits → smallest estimated window (or 2048), never invented capacity.
+- **Speculative decoding**: `LoadRequest.draft_model_path` (+ `draft_ngl`, `draft_max` default 8) adds `--model-draft` / `--gpu-layers-draft` / `--draft-max`; the draft GGUF header is validated like the main model.
 - **No binary → builtin micro-eval mode** (real deterministic engine, never a stub, always labeled).
 - **Idle auto-unload**: `recv_timeout(1s)` loop tracks `last_activity`; after `idle_secs` (default 300) the child is killed and state cleared.
-- Chat proxies to llama-server `/v1/chat/completions` (temperature 0) or runs micro-eval; measures elapsed + token count for `X-Vibe-Local-Tok-Per-Sec`.
+- Chat proxies to llama-server `/v1/chat/completions` (temperature 0) or runs micro-eval; measures elapsed + token count for `X-Vibe-Local-Tok-Per-Sec`. `Engine::chat_messages(Vec<ChatMessage>, …)` passes the **full OpenAI-style message array unflattened** to llama-server (roles validated: system/user/assistant); the builtin path flattens system turns to `System: …` + user text, matching the CLI prompt extraction.
 
 ### 3.2 Micro-eval (`microeval.rs`)
 
@@ -134,7 +136,7 @@ Real sensors: Linux/Android `/sys/class/thermal/thermal_zone*/temp` (CPU/SoC zon
 
 ## 4. CLI + Vibe-Link server (`vibe-local-cli`)
 
-### 4.1 HTTP surface (`server.rs`, tiny_http, 4 workers)
+### 4.1 HTTP surface (`server.rs`, tiny_http, 8 workers)
 
 | Route | Behavior |
 |---|---|
@@ -144,8 +146,10 @@ Real sensors: Linux/Android `/sys/class/thermal/thermal_zone*/temp` (CPU/SoC zon
 | `GET /api/leaderboard?profile=` | entries + derived scores + Pareto mask + profiles |
 | `POST /api/leaderboard/submit` | validated entry upsert (rejects `seed_estimate`), per-pillar audit rows |
 | `GET /api/discover?query=` / `GET /api/models?query=` | live HF crawl / cached DB |
-| `POST /api/load` / `POST /api/unload` / `POST /api/idle` / `POST /api/thermal` | engine control |
-| `POST /api/vibemark` / `GET /api/vibemark/latest` | benchmark run + persistence |
+| `POST /api/load` / `POST /api/unload` / `POST /api/idle` / `POST /api/thermal` | engine control (`LoadRequest`: auto-context, speculative draft fields) |
+| `POST /api/prewarm` | background model load: `202 loading` / `200 already_loaded` / `409` in-flight; claims the single-flight slot **before** querying engine status so the guard holds while the worker is busy |
+| `POST /api/vibemark` / `GET /api/vibemark/latest` | benchmark run + persistence; a second concurrent run gets `409` |
+| `GET /api/grid/capabilities` | capability directory proxied from the coordinator (`?coordinator=` + `X-Compost-Key`) |
 | `GET /v1/models`, `POST /v1/chat/completions` | OpenAI-compatible; `strip_think` body flag or `X-Vibe-Strip-Think: 1`; router headers on every response |
 | `GET /`, `/leaderboard`, static assets | web UI with strict CSP + traversal protection |
 | `GET /catalog.json` | bundled seed catalog (or DB-synthesized) |
@@ -159,15 +163,15 @@ Real sensors: Linux/Android `/sys/class/thermal/thermal_zone*/temp` (CPU/SoC zon
 
 ### 4.3 CLI (`main.rs`)
 
-`scan`, `discover`, `inspect-gguf`, `bench` (resolves HF ids → trusted quant download → VibeMark → optional `--submit`), `serve` (`--port/--lan/--token/--idle`, global `--portable/--db`), `leaderboard` (live server first, local DB fallback). `bench --submit` merges quality pillars from the matching seed entry **labeled per-pillar `source: seed_estimate`**, while throughput pillars are genuinely measured.
+`scan`, `discover`, `inspect-gguf`, `bench` (resolves HF ids → trusted quant download → VibeMark → optional `--submit`), `serve` (`--port/--lan/--token/--idle`, global `--portable/--db`), `leaderboard` (live server first, local DB fallback), `cluster` (§14). `bench --submit` merges quality pillars from the matching seed entry **labeled per-pillar `source: seed_estimate`**, while throughput pillars are genuinely measured; entries without quality pillars carry provenance `throughput_only`.
 
 ## 5. JNI bridge (`vibe-local-jni`)
 
-`cdylib` + `staticlib` + `rlib`. All `Java_com_vibelocal_app_core_VibeLocalBridge_*` functions return JSON strings (`{"ok":true,"data":…}` / `{"ok":false,"error":…}`), wrap panics via `catch_unwind`, and share one global `BridgeState` (DB + engine + server handle). The Android app runs the **same server code** as the PC. C-ABI mirrors (`vibe_local_*`) with explicit `vibe_local_free_string` ownership.
+`cdylib` + `staticlib` + `rlib`. All `Java_com_vibelocal_app_core_VibeLocalBridge_*` functions return JSON strings (`{"ok":true,"data":…}` / `{"ok":false,"error":…}`), wrap panics via `catch_unwind`, and share one global `BridgeState` (DB + engine + server handle). The Android app runs the **same server code** as the PC. C-ABI mirrors (`vibe_local_*`) with explicit `vibe_local_free_string` ownership. Wave 3 adds `loadModel(configJson)` (full `LoadRequest` JSON → `engine.load`, returns `{loaded_model, backend, engine}`) and `chatMessages(messagesJson, stripThink)` (OpenAI-style message array → `engine.chat_messages`, unflattened multi-turn) with C-ABI mirrors `vibe_local_load_model` / `vibe_local_chat_messages`; every pre-existing symbol is preserved. Kotlin declarations live in `VibeLocalBridge.kt`, guarded wrappers in `SafeBridge.kt`.
 
 ## 6. Android app (`android/`)
 
-Kotlin + Jetpack Compose, Material 3 Obsidian Dark (`#090A0F` / `#131620`). Tabs: Scan & Match, 10-Pillar Leaderboard, VibeMark, Chat & Vibe-Link LAN Worker. Guards: `LmkdMemoryGuard` (MemoryInfo polling + 512MB margin + trim-memory unload), `ThermalGovernor` (PowerManager listener → native `setThermalReading`), `VibeLinkForegroundService` (dataSync, notification, wake lock), `AutoUnloadIdleTimer` (300s default). LAN toggle generates a `SecureRandom` token and starts the token-gated server; HTTP fallback when the native lib is unavailable.
+Kotlin + Jetpack Compose, Material 3 Obsidian Dark (`#090A0F` / `#131620`). Tabs: Scan & Match, 10-Pillar Leaderboard, VibeMark, Chat & Vibe-Link LAN Worker, Vibe Grid. Guards: `LmkdMemoryGuard` (MemoryInfo polling + 512MB margin + trim-memory unload), `ThermalGovernor` (PowerManager listener → native `setThermalReading`), `VibeLinkForegroundService` (dataSync, notification, wake lock), `AutoUnloadIdleTimer` (300s default). LAN toggle generates a `SecureRandom` token and starts the token-gated server; HTTP fallback when the native lib is unavailable.
 
 ## 7. Benchmark suite (`benchmarks/`)
 
@@ -234,6 +238,7 @@ semantics, v3 defaults) rather than Go gob.
 | `workload` | Preset SPI + `mandelbrot` (exact tile geometry/palette, PNG, ≤0.05% edge-pixel replica tolerance), `primes` (6k±1, π-verified), `wordcount` (word-aligned map/reduce), `llm_batch` (JSONL/MD/lines, verify mode, live `:20129`), `moe_distributed` |
 | `persist` | Gzipped JSON snapshots v4 (v3-compatible defaults) |
 | `moe_grid` | Distributed MoE planner + fault-tolerant shard router (below) |
+| `grid_discovery` | UDP `VIBE_GRID_DISCOVER_V1` responder (port 20132) + broadcast `discover()` (Wave 3, §16) |
 
 ### Guards (agent + scheduler, both sides)
 
@@ -288,8 +293,10 @@ measures the partition.
 
 ## 14. Integration surfaces
 
-- **CLI:** `vibe-local cluster coordinator|agent|plan-moe|submit|status|nodes|jobs|cancel`.
-- **Vibe-Link proxy (`grid_proxy.rs`):** same-origin `/api/grid/state|plan|jobs|cancel|tiles|artifact`
+- **CLI:** `vibe-local cluster coordinator|agent|plan-moe|submit|status|nodes|jobs|cancel|capabilities|discover`;
+  `agent --capabilities llm,embed_rag` overrides auto-detection,
+  `submit --required-capability llm` targets the lease (§16).
+- **Vibe-Link proxy (`grid_proxy.rs`):** same-origin `/api/grid/state|plan|jobs|cancel|tiles|artifact|capabilities`
   on :20129 forwards to the :7900 coordinator (keeps web CSP `connect-src 'self'`).
   LAN-proxy URL validation allows loopback/RFC1918 (the fleet lives there) but
   blocks link-local/multicast/unspecified; `X-Compost-Key` is forwarded.
@@ -313,3 +320,89 @@ agent end-to-end primes; MoE heterogeneous partitioning (PC 8GB VRAM + 12GB/6GB
 phones), draft fallback, node-drop reroute + backbone promotion, real GGUF
 expert paging; JNI coordinator+agent+plan round-trip. Ghost-GPU fix verified
 live on the reference host (only RX 580 reported).
+---
+
+# Wave 3 — hardening, speculative decoding, capability mesh
+
+## 16. Wave 3 changes
+
+### 16.1 Bug fixes & concurrency hardening
+
+- **UTF-8-safe truncation** (`commands.rs`, `cluster_cli.rs`): display
+  truncation walks char boundaries instead of slicing bytes — multibyte
+  model names/prompts can no longer panic.
+- **mDNS robustness** (`discovery.rs`): the 5353 socket binds with
+  `SO_REUSEADDR` (coexists with a system resolver), initialization is
+  best-effort (failure degrades to UDP-only discovery, never kills the
+  server), and the query parser handles multi-question sections and
+  compression pointers without panicking on malformed packets.
+- **Offline `local_ip()`**: RFC1918 UDP-connect probes plus interface
+  enumeration replace the old single probe — correct LAN IP on hosts with
+  VPNs/virtual adapters, no packets actually sent.
+- **Honest throughput metrics**: `Throughput.peak_vram_mb` /
+  `thermal_delta_c` are `Option<f64>` (`null` without sensors);
+  throughput-only entries carry provenance `throughput_only` in the
+  dedup ladder **measured > submitted > throughput_only > seed_estimate**.
+- **WMI thermal failure cached** (`thermal.rs`): one failed
+  `MSAcpi_ThermalZoneTemperature` probe marks WMI unavailable for the
+  process — no repeated multi-second PowerShell stalls per request.
+- **8 HTTP workers** (was 4) so slow routes (vibemark, discover, chat)
+  cannot starve `/api/status`; **single-flight guards**: a second
+  concurrent VibeMark or prewarm gets `409` instead of queueing.
+
+### 16.2 Speculative decoding, auto-context, prewarm
+
+`LoadRequest` gains `draft_model_path` / `draft_ngl` / `draft_max`
+(default 8) → llama-server `--model-draft` / `--gpu-layers-draft` /
+`--draft-max` (draft GGUF header validated). `ctx == 0` auto-sizes from
+GGUF RAM estimates vs live VRAM/RAM minus 512MB (§3.1).
+`POST /api/prewarm` loads in a background thread: the single-flight slot
+is claimed **before** `engine.status()` (which queues behind a running
+benchmark), so overlapping prewarms reliably get `409`; responses are
+`202 {"state":"loading"}` / `200 {"state":"already_loaded"}`.
+
+### 16.3 Heterogeneous capability routing + discovery
+
+- `Caps` gains `capabilities: Vec<String>` + `loaded_models: Vec<String>`
+  (serde defaults + skip-if-empty — legacy compost v0.7.0 agents stay
+  wire-compatible). Known labels: `llm`, `vision`, `stt`, `tts`,
+  `image_gen`, `video_gen`, `embed_rag`; empty = general compute.
+- Auto-detection: a successful local `:20129` LLM probe advertises `llm`
+  and the probed model list; `agent --capabilities a,b` overrides with
+  validated, deduplicated labels.
+- `Job` / `SubmitJobRequest` gain `required_capability` (validated against
+  the label set at submit, `400` on unknown). `lease_batch` skips nodes
+  that don't advertise the required capability — capability-targeted work
+  never lands on a phone without an LLM.
+- `GET /api/v1/capabilities` (coordinator) / `GET /api/grid/capabilities`
+  (:20129 proxy) / `cluster capabilities`: directory grouped by capability
+  (`compute` for general nodes) with `node_id`, `name`, `ip`,
+  `lan_endpoint` (`http://<node-ip>:20129`), `speed_factor`, guard state
+  (`paused`, `available`), battery/thermal readings and `loaded_models`.
+- **UDP fleet discovery** (`grid_discovery.rs`): coordinators answer
+  `VIBE_GRID_DISCOVER_V1` broadcasts on port **20132** with
+  `{service:"vibe-grid", coordinator_port, host, version}` (bind failure
+  is a warning, never fatal); `cluster discover [--timeout-ms]`
+  broadcasts to 255.255.255.255 + loopback and dedupes responders.
+
+### 16.4 Multi-turn JNI surface
+
+`loadModel(configJson)` and `chatMessages(messagesJson, stripThink)` (§5)
+expose the full `LoadRequest` and unflattened OpenAI message arrays to
+Android; `Engine::chat_messages` validates roles (system/user/assistant)
+and rejects empty arrays before touching the worker. All pre-existing
+JNI/C-ABI symbols are unchanged.
+
+## 17. Wave 3 verification
+
+165 workspace tests pass: core 46, engine 20 (auto-context sizing, draft
+validation, multi-turn builtin chat), cluster 67 (capability wire
+compatibility, targeted leasing, capability directory + guards, UDP
+discovery responder/probe, end-to-end capability routing with unknown-label
+400), cli 27 (prewarm 202/200/409 + concurrent-VibeMark 409 under a live
+benchmark, UTF-8 truncation, mDNS multi-question/compression-pointer
+parsing, SO_REUSEADDR coexistence), jni 5 (loadModel/chatMessages error
+paths + builtin round-trip). Gates: `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace`, `python benchmarks/kaggle_10pillar_bench.py
+--self-test` (15/15).

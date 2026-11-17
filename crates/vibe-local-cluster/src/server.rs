@@ -292,6 +292,11 @@ pub fn start_coordinator(opts: CoordinatorOptions) -> anyhow::Result<Arc<Coordin
         );
     }
 
+    // Best-effort LAN discovery responder (UDP :20132).
+    if let Some(h) = crate::grid_discovery::spawn_responder(port, Arc::clone(&stop)) {
+        background.push(h);
+    }
+
     if coordinator.keys.enabled() {
         eprintln!(
             "[coordinator] fleet secret: ENABLED — mutations + sensitive artifacts need {}",
@@ -768,6 +773,18 @@ fn route(
             };
             job.replicate = req.replicate;
             job.priority = req.priority.clamp(0, 10);
+            if let Some(cap) = &req.required_capability {
+                if !crate::proto::CAPABILITIES.contains(&cap.as_str()) {
+                    return err_resp(
+                        400,
+                        &format!(
+                            "unknown capability {cap:?}; known: {:?}",
+                            crate::proto::CAPABILITIES
+                        ),
+                    );
+                }
+                job.required_capability = Some(cap.clone());
+            }
             job.meta = req.meta.clone();
             if !req.mode.is_empty() {
                 job.meta.entry("mode".into()).or_insert(req.mode.clone());
@@ -848,6 +865,7 @@ fn route(
             coord.settle_artifact(job_id);
             json_resp(200, json!({"status": "cancelled", "job": job_id}))
         }
+        (Method::Get, "/api/v1/capabilities") => json_resp(200, coord.queue.capability_directory()),
         (Method::Get, "/api/v1/state") => {
             metrics::count_route("state");
             let mut st = coord.queue.snapshot();
@@ -1248,6 +1266,87 @@ mod tests {
         let st = handle2.coordinator.queue.snapshot();
         assert_eq!(st.jobs[0].status, JOB_DONE);
         handle2.shutdown();
+    }
+
+    #[test]
+    fn capability_routing_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = start_coordinator(opts(dir.path())).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port);
+        let plain_caps = json!({"cores": 4, "mem_mb": 8192, "score": 1.0, "battery_pct": -1, "on_battery": false, "temp_c": -1, "arch": "x86_64", "os": "linux", "version": "0.7.0"});
+        let mut llm_caps = plain_caps.clone();
+        llm_caps["capabilities"] = json!(["llm"]);
+        llm_caps["loaded_models"] = json!(["qwen2.5-7b"]);
+        let plain: serde_json::Value = post(
+            &base,
+            "/api/v1/join",
+            json!({"name": "plain", "caps": plain_caps}),
+            None,
+        )
+        .into_json()
+        .unwrap();
+        let llm: serde_json::Value = post(
+            &base,
+            "/api/v1/join",
+            json!({"name": "gpu", "caps": llm_caps}),
+            None,
+        )
+        .into_json()
+        .unwrap();
+        // Unknown capability labels are rejected at submit.
+        let err = ureq::post(&format!("{base}/api/v1/jobs"))
+            .send_json(json!({"kind": "primes", "params": {"limit": 1000}, "required_capability": "telepathy"}))
+            .unwrap_err();
+        match err {
+            ureq::Error::Status(code, _) => assert_eq!(code, 400),
+            other => panic!("expected HTTP 400, got {other:?}"),
+        }
+        let submit: serde_json::Value = post(
+            &base,
+            "/api/v1/jobs",
+            json!({"kind": "primes", "params": {"limit": 1000}, "required_capability": "llm"}),
+            None,
+        )
+        .into_json()
+        .unwrap();
+        assert_eq!(submit["job"]["required_capability"], "llm");
+        // The capability-less node never receives the targeted task.
+        let p: serde_json::Value = post(
+            &base,
+            "/api/v1/poll",
+            json!({"node_id": plain["node_id"], "name": "plain", "caps": plain_caps, "running": 0, "workers": 1}),
+            None,
+        )
+        .into_json()
+        .unwrap();
+        assert!(p["task"].is_null());
+        let p: serde_json::Value = post(
+            &base,
+            "/api/v1/poll",
+            json!({"node_id": llm["node_id"], "name": "gpu", "caps": llm_caps, "running": 0, "workers": 1}),
+            None,
+        )
+        .into_json()
+        .unwrap();
+        assert_eq!(p["task"]["kind"], "primes");
+        // Capability directory for Vibe Router.
+        let dirv: serde_json::Value = ureq::get(&format!("{base}/api/v1/capabilities"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        let llm_group = dirv["capabilities"]["llm"].as_array().unwrap();
+        assert_eq!(llm_group.len(), 1);
+        assert_eq!(llm_group[0]["name"], "gpu");
+        assert_eq!(llm_group[0]["loaded_models"][0], "qwen2.5-7b");
+        assert!(
+            llm_group[0]["lan_endpoint"]
+                .as_str()
+                .unwrap()
+                .starts_with("http://127.0.0.1:")
+        );
+        assert_eq!(dirv["capabilities"]["compute"].as_array().unwrap().len(), 1);
+        handle.shutdown();
     }
 
     #[test]

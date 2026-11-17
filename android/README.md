@@ -94,12 +94,13 @@ com.vibelocal.app
 │   ├── DownloadController          DownloadManager → staging → models dir import
 │   └── AppPrefs                    SharedPreferences settings
 ├── ui
-│   ├── MainScreen                  4-tab Scaffold + global safety banners
+│   ├── MainScreen                  5-tab Scaffold + global safety banners
 │   ├── theme                       Obsidian Dark (#090A0F / #131620 / #7C5CFF / #22D3EE)
 │   ├── scan                        Scan & Match tab (StateFlow ViewModel)
 │   ├── leaderboard                 10-pillar leaderboard + Canvas Pareto chart
 │   ├── vibemark                    benchmark tab
-│   └── chat                        chat + LAN worker + settings tab
+│   ├── chat                        chat + LAN worker + settings tab
+│   └── grid                        Vibe Grid fleet worker / planner / coordinator tab
 └── util                            JSON helpers, LAN IP discovery, formatting
 ```
 

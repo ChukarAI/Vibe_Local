@@ -30,8 +30,17 @@ pub struct LoadRequest {
     pub backend: String,
     #[serde(default = "default_ngl")]
     pub ngl: u32,
-    #[serde(default = "default_ctx")]
+    /// 0 = auto-size from the GGUF RAM estimates against live VRAM/RAM,
+    /// preserving a 512MB safety margin.
+    #[serde(default)]
     pub ctx: u32,
+    /// Small draft GGUF for native speculative decoding (`--model-draft`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_model_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_ngl: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_max: Option<u32>,
 }
 
 fn default_backend() -> String {
@@ -40,8 +49,39 @@ fn default_backend() -> String {
 fn default_ngl() -> u32 {
     0
 }
-fn default_ctx() -> u32 {
-    4096
+
+pub const CTX_SAFETY_MARGIN_MB: f64 = 512.0;
+pub const DEFAULT_DRAFT_MAX: u32 = 8;
+
+/// Pick the largest GGUF-estimated context window that fits live memory
+/// (VRAM when offloading, else free RAM) minus a 512MB safety margin,
+/// capped at the model's trained context length.
+pub fn auto_context(
+    info: &vibe_local_core::gguf::GgufInfo,
+    req: &LoadRequest,
+    hw: &vibe_local_core::HardwareReport,
+) -> u32 {
+    let vram = if req.ngl > 0 && req.backend != "cpu" {
+        hw.gpus.iter().filter_map(|g| g.vram_mb).max()
+    } else {
+        None
+    };
+    let budget_mb = vram.unwrap_or(hw.ram_free_mb) as f64 - CTX_SAFETY_MARGIN_MB;
+    let mut estimates: Vec<_> = info.ram.iter().collect();
+    estimates.sort_by_key(|r| r.ctx);
+    let cap = info.context_length.unwrap_or(u64::MAX);
+    let mut chosen: Option<u64> = None;
+    for r in &estimates {
+        if r.ctx <= cap && r.total_mb <= budget_mb {
+            chosen = Some(r.ctx);
+        }
+    }
+    // Nothing fits: fall back to the smallest estimated window (or 2048
+    // when the GGUF carries no estimates) rather than inventing capacity.
+    let pick = chosen
+        .or_else(|| estimates.first().map(|r| r.ctx))
+        .unwrap_or(2048);
+    pick.min(cap) as u32
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +92,13 @@ pub struct ChatReply {
     pub tok_per_sec: f64,
     pub backend: String,
     pub engine: String,
+}
+
+/// OpenAI-style chat message, passed through to llama-server unflattened.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,7 +116,7 @@ enum EngineCommand {
     Load(LoadRequest, SyncSender<anyhow::Result<()>>),
     Unload(SyncSender<()>),
     Chat {
-        prompt: String,
+        messages: Vec<ChatMessage>,
         strip: bool,
         max_tokens: u32,
         resp: SyncSender<anyhow::Result<ChatReply>>,
@@ -167,10 +214,35 @@ impl Engine {
     }
 
     pub fn chat(&self, prompt: &str, strip: bool, max_tokens: u32) -> anyhow::Result<ChatReply> {
-        let prompt = prompt.to_string();
+        self.chat_messages(
+            vec![ChatMessage {
+                role: "user".into(),
+                content: prompt.to_string(),
+            }],
+            strip,
+            max_tokens,
+        )
+    }
+
+    /// Multi-turn chat: the full OpenAI message array reaches llama-server
+    /// intact; the builtin fallback flattens it (labeled builtin-microeval).
+    pub fn chat_messages(
+        &self,
+        messages: Vec<ChatMessage>,
+        strip: bool,
+        max_tokens: u32,
+    ) -> anyhow::Result<ChatReply> {
+        anyhow::ensure!(!messages.is_empty(), "messages must not be empty");
+        for m in &messages {
+            anyhow::ensure!(
+                matches!(m.role.as_str(), "system" | "user" | "assistant"),
+                "unsupported message role {:?} (system/user/assistant)",
+                m.role
+            );
+        }
         self.call(
             |tx| EngineCommand::Chat {
-                prompt,
+                messages,
                 strip,
                 max_tokens,
                 resp: tx,
@@ -300,7 +372,7 @@ fn worker_loop(
                     }
                 }
                 EngineCommand::Chat {
-                    prompt,
+                    messages,
                     strip,
                     max_tokens,
                     resp,
@@ -324,7 +396,7 @@ fn worker_loop(
                             };
                             chat_with(
                                 model,
-                                &prompt,
+                                &messages,
                                 strip,
                                 effective_max.max(16),
                                 &micro,
@@ -414,11 +486,25 @@ fn load_model(
     anyhow::ensure!(path.is_file(), "model file not found: {}", req.path);
     // Validate the GGUF header before committing to a load.
     let info = vibe_local_core::gguf::parse_file(&path)?;
+    let mut req = req.clone();
+    if req.ctx == 0 {
+        req.ctx = auto_context(
+            &info,
+            &req,
+            &vibe_local_core::hardware::HardwareProbe::scan(),
+        );
+        eprintln!("[vibe-engine] auto context window: {} tokens", req.ctx);
+    }
+    if let Some(draft) = &req.draft_model_path {
+        let draft_path = PathBuf::from(draft);
+        anyhow::ensure!(draft_path.is_file(), "draft model file not found: {draft}");
+        vibe_local_core::gguf::parse_file(&draft_path)?;
+    }
     let _ = micro.ingest(&info.architecture);
 
     let Some(binary) = find_llama_server(config.llama_server_path.as_ref()) else {
         return Ok(LoadedModel {
-            req: req.clone(),
+            req,
             child: None,
             engine: "builtin-microeval".into(),
             last_activity: Instant::now(),
@@ -437,9 +523,16 @@ fn load_model(
         .arg("-c")
         .arg(req.ctx.to_string())
         .arg("-np")
-        .arg("1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .arg("1");
+    if let Some(draft) = &req.draft_model_path {
+        cmd.arg("--model-draft")
+            .arg(draft)
+            .arg("--gpu-layers-draft")
+            .arg(req.draft_ngl.unwrap_or(0).to_string())
+            .arg("--draft-max")
+            .arg(req.draft_max.unwrap_or(DEFAULT_DRAFT_MAX).to_string());
+    }
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
     match req.backend.as_str() {
         "cuda" => {
             cmd.env("CUDA_VISIBLE_DEVICES", "0");
@@ -480,7 +573,7 @@ fn load_model(
         anyhow::bail!("llama-server did not become healthy within 150s");
     }
     Ok(LoadedModel {
-        req: req.clone(),
+        req,
         child: Some(child),
         engine: "llama-server".into(),
         last_activity: Instant::now(),
@@ -489,7 +582,7 @@ fn load_model(
 
 fn chat_with(
     model: &mut LoadedModel,
-    prompt: &str,
+    messages: &[ChatMessage],
     strip: bool,
     max_tokens: u32,
     micro: &MicroEval,
@@ -499,7 +592,7 @@ fn chat_with(
     let (text, tokens) = if model.engine == "llama-server" {
         let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
         let body = serde_json::json!({
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0.0,
             "stream": false,
@@ -517,7 +610,17 @@ fn chat_with(
         let tokens = json["usage"]["completion_tokens"].as_u64().unwrap_or(0);
         (text, tokens)
     } else {
-        let text = micro.generate_text(prompt);
+        // Builtin fallback has no chat template: flatten like the Vibe-Link
+        // server's extract_prompt (System: prefix + user turns).
+        let mut parts = Vec::new();
+        for m in messages {
+            if m.role == "system" {
+                parts.push(format!("System: {}", m.content));
+            } else if m.role == "user" {
+                parts.push(m.content.clone());
+            }
+        }
+        let text = micro.generate_text(&parts.join("\n"));
         let tokens = tokenize(&text).len() as u64;
         (text, tokens)
     };
@@ -720,6 +823,9 @@ mod tests {
                 backend: "cpu".into(),
                 ngl: 0,
                 ctx: 2048,
+                draft_model_path: None,
+                draft_ngl: None,
+                draft_max: None,
             })
             .unwrap();
         let status = engine.status().unwrap();
@@ -738,6 +844,88 @@ mod tests {
     }
 
     #[test]
+    fn chat_messages_multi_turn_builtin() {
+        let engine = Engine::start(EngineConfig::default());
+        // Boundary validation happens before the worker is touched.
+        assert!(engine.chat_messages(vec![], true, 64).is_err());
+        assert!(
+            engine
+                .chat_messages(
+                    vec![ChatMessage {
+                        role: "tool".into(),
+                        content: "x".into()
+                    }],
+                    true,
+                    64
+                )
+                .is_err()
+        );
+        if find_llama_server(None).is_some() {
+            engine.shutdown();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("tiny-Q4_K_M.gguf");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&vibe_local_core::gguf::GGUF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let key = b"general.architecture";
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        let val = b"llama";
+        bytes.extend_from_slice(&(val.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(val);
+        std::fs::write(&model_path, bytes).unwrap();
+        engine
+            .load(LoadRequest {
+                path: model_path.to_string_lossy().into_owned(),
+                backend: "cpu".into(),
+                ngl: 0,
+                ctx: 0,
+                draft_model_path: None,
+                draft_ngl: None,
+                draft_max: None,
+            })
+            .unwrap();
+        let reply = engine
+            .chat_messages(
+                vec![
+                    ChatMessage {
+                        role: "system".into(),
+                        content: "You are a calculator.".into(),
+                    },
+                    ChatMessage {
+                        role: "user".into(),
+                        content: "What is 21 * 2?".into(),
+                    },
+                ],
+                true,
+                128,
+            )
+            .unwrap();
+        // The builtin fallback flattens turns; with a System prefix the
+        // pure-arithmetic path no longer applies, but a reply must exist.
+        assert!(!reply.text.is_empty());
+        assert_eq!(reply.engine, "builtin-microeval");
+        // A single user turn behaves exactly like chat().
+        let single = engine
+            .chat_messages(
+                vec![ChatMessage {
+                    role: "user".into(),
+                    content: "What is 21 * 2?".into(),
+                }],
+                true,
+                128,
+            )
+            .unwrap();
+        assert!(single.text.contains("42"), "got {}", single.text);
+        engine.shutdown();
+    }
+
+    #[test]
     fn load_missing_file_fails() {
         let engine = Engine::start(EngineConfig::default());
         let err = engine
@@ -746,6 +934,9 @@ mod tests {
                 backend: "cpu".into(),
                 ngl: 0,
                 ctx: 2048,
+                draft_model_path: None,
+                draft_ngl: None,
+                draft_max: None,
             })
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
@@ -762,6 +953,153 @@ mod tests {
         engine.set_idle_secs(600);
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(engine.status().unwrap().idle_timeout_secs, 600);
+        engine.shutdown();
+    }
+
+    fn synthetic_info() -> vibe_local_core::gguf::GgufInfo {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&vibe_local_core::gguf::GGUF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let mut info = vibe_local_core::gguf::parse_reader(std::io::Cursor::new(bytes)).unwrap();
+        info.ram = vec![
+            vibe_local_core::gguf::ContextRam {
+                ctx: 2048,
+                weights_mb: 4000.0,
+                kv_cache_mb: 100.0,
+                compute_mb: 200.0,
+                total_mb: 4300.0,
+            },
+            vibe_local_core::gguf::ContextRam {
+                ctx: 4096,
+                weights_mb: 4000.0,
+                kv_cache_mb: 200.0,
+                compute_mb: 200.0,
+                total_mb: 4400.0,
+            },
+            vibe_local_core::gguf::ContextRam {
+                ctx: 8192,
+                weights_mb: 4000.0,
+                kv_cache_mb: 400.0,
+                compute_mb: 200.0,
+                total_mb: 4600.0,
+            },
+            vibe_local_core::gguf::ContextRam {
+                ctx: 16384,
+                weights_mb: 4000.0,
+                kv_cache_mb: 800.0,
+                compute_mb: 200.0,
+                total_mb: 5000.0,
+            },
+        ];
+        info
+    }
+
+    fn req_for(ctx: u32, ngl: u32, backend: &str) -> LoadRequest {
+        LoadRequest {
+            path: "m.gguf".into(),
+            backend: backend.into(),
+            ngl,
+            ctx,
+            draft_model_path: None,
+            draft_ngl: None,
+            draft_max: None,
+        }
+    }
+
+    #[test]
+    fn auto_context_picks_largest_safe_window() {
+        let info = synthetic_info();
+        let mut hw = vibe_local_core::hardware::HardwareProbe::scan();
+        hw.ram_free_mb = 5200; // 5200 - 512 margin = 4688 -> 8192 fits, 16384 not
+        hw.gpus.clear();
+        assert_eq!(auto_context(&info, &req_for(0, 0, "cpu"), &hw), 8192);
+        // VRAM path: 8GB card offloading -> 16384 (5000MB) fits in 8192-512.
+        hw.gpus.push(vibe_local_core::hardware::GpuInfo {
+            name: "Test GPU".into(),
+            vendor: "test".into(),
+            vram_mb: Some(8192),
+            backend: "vulkan".into(),
+        });
+        assert_eq!(auto_context(&info, &req_for(0, 99, "vulkan"), &hw), 16384);
+        // Tiny budget: nothing fits -> smallest estimate, never a fake big ctx.
+        hw.ram_free_mb = 1024;
+        hw.gpus.clear();
+        assert_eq!(auto_context(&info, &req_for(0, 0, "cpu"), &hw), 2048);
+        // Trained context cap is respected.
+        let mut capped = synthetic_info();
+        capped.context_length = Some(4096);
+        hw.ram_free_mb = 32000;
+        assert_eq!(auto_context(&capped, &req_for(0, 0, "cpu"), &hw), 4096);
+        // No estimates at all -> conservative 2048.
+        let mut empty = synthetic_info();
+        empty.ram.clear();
+        assert_eq!(auto_context(&empty, &req_for(0, 0, "cpu"), &hw), 2048);
+    }
+
+    #[test]
+    fn load_request_serde_defaults() {
+        let req: LoadRequest = serde_json::from_str(r#"{"path":"m.gguf"}"#).unwrap();
+        assert_eq!(req.ctx, 0, "omitted ctx must mean auto-size");
+        assert_eq!(req.backend, "cpu");
+        assert!(req.draft_model_path.is_none());
+        let full: LoadRequest = serde_json::from_str(
+            r#"{"path":"m.gguf","ctx":8192,"draft_model_path":"d.gguf","draft_ngl":99,"draft_max":16}"#,
+        )
+        .unwrap();
+        assert_eq!(full.draft_max, Some(16));
+        assert_eq!(full.draft_ngl, Some(99));
+    }
+
+    #[test]
+    fn draft_model_validated_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("tiny-Q4_K_M.gguf");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&vibe_local_core::gguf::GGUF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&model_path, &bytes).unwrap();
+
+        let engine = Engine::start(EngineConfig::default());
+        // Missing draft file is rejected before any spawn.
+        let err = engine
+            .load(LoadRequest {
+                path: model_path.to_string_lossy().into_owned(),
+                draft_model_path: Some(dir.path().join("nope.gguf").to_string_lossy().into_owned()),
+                ..req_for(2048, 0, "cpu")
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("draft model file not found"));
+        // Invalid draft header is rejected too.
+        let bad_draft = dir.path().join("bad.gguf");
+        std::fs::write(&bad_draft, b"not a gguf").unwrap();
+        assert!(
+            engine
+                .load(LoadRequest {
+                    path: model_path.to_string_lossy().into_owned(),
+                    draft_model_path: Some(bad_draft.to_string_lossy().into_owned()),
+                    ..req_for(2048, 0, "cpu")
+                })
+                .is_err()
+        );
+        if find_llama_server(None).is_none() {
+            // Valid draft loads in builtin mode; ctx 0 auto-resolves.
+            let draft = dir.path().join("draft-Q4_K_M.gguf");
+            std::fs::write(&draft, &bytes).unwrap();
+            engine
+                .load(LoadRequest {
+                    path: model_path.to_string_lossy().into_owned(),
+                    draft_model_path: Some(draft.to_string_lossy().into_owned()),
+                    draft_max: Some(16),
+                    ..req_for(0, 0, "cpu")
+                })
+                .unwrap();
+            assert!(engine.status().unwrap().loaded_model.is_some());
+            engine.unload();
+        }
         engine.shutdown();
     }
 }

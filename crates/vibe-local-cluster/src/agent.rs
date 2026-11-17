@@ -33,6 +33,9 @@ pub struct AgentConfig {
     pub heartbeat_every: Duration,
     /// Optional injected caps (Android supplies battery/thermal from Kotlin).
     pub caps_override: Option<Caps>,
+    /// Explicit capability labels to advertise ("llm", "vision", ...).
+    /// Empty = auto-detect from the local environment.
+    pub capabilities: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -47,6 +50,7 @@ impl Default for AgentConfig {
             workers: 2,
             heartbeat_every: Duration::from_secs(5),
             caps_override: None,
+            capabilities: Vec::new(),
         }
     }
 }
@@ -245,6 +249,17 @@ impl Agent {
             None => node::detect(),
         };
         c.score = self.caps_score;
+        if !self.cfg.capabilities.is_empty() {
+            c.capabilities.clear();
+            for cap in &self.cfg.capabilities {
+                let cap = cap.trim().to_lowercase();
+                if crate::proto::CAPABILITIES.contains(&cap.as_str())
+                    && !c.capabilities.contains(&cap)
+                {
+                    c.capabilities.push(cap);
+                }
+            }
+        }
         c
     }
 

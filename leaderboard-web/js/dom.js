@@ -82,6 +82,7 @@ export function provenanceBadge(provenance) {
   switch (provenance) {
     case 'measured': return badge('measured', 'measured');
     case 'submitted': return badge('submitted', 'submitted');
+    case 'throughput_only': return badge('throughput', 'throughput only');
     default: return badge('estimate', 'estimate');
   }
 }

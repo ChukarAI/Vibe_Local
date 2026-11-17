@@ -215,6 +215,33 @@ fn api_chat(prompt: &str, strip_think: bool) -> Value {
     }))
 }
 
+fn api_load_model(config_json: &str) -> Value {
+    wrap(with_state(None, |s| {
+        let req: vibe_local_engine::LoadRequest = serde_json::from_str(config_json)
+            .map_err(|e| anyhow::anyhow!("invalid load config JSON: {e}"))?;
+        s.engine.load(req)?;
+        let status = s.engine.status()?;
+        Ok(json!({
+            "loaded_model": status.loaded_model,
+            "backend": status.backend,
+            "engine": status.engine,
+        }))
+    }))
+}
+
+fn api_chat_messages(messages_json: &str, strip_think: bool) -> Value {
+    wrap(with_state(None, |s| {
+        let messages: Vec<vibe_local_engine::ChatMessage> = serde_json::from_str(messages_json)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid messages JSON (expected [{{\"role\":...,\"content\":...}}]): {e}"
+                )
+            })?;
+        let reply = s.engine.chat_messages(messages, strip_think, 1024)?;
+        Ok(serde_json::to_value(reply)?)
+    }))
+}
+
 fn api_unload() -> Value {
     wrap(with_state(None, |s| {
         s.engine.unload();
@@ -390,6 +417,28 @@ pub extern "system" fn Java_com_vibelocal_app_core_VibeLocalBridge_chat(
     let prompt = jstr(&mut env, &prompt);
     let strip = strip_think != 0;
     guarded(&mut env, move || api_chat(&prompt, strip))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_vibelocal_app_core_VibeLocalBridge_loadModel(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+) -> jstring {
+    let cfg = jstr(&mut env, &config_json);
+    guarded(&mut env, move || api_load_model(&cfg))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_vibelocal_app_core_VibeLocalBridge_chatMessages(
+    mut env: JNIEnv,
+    _class: JClass,
+    messages_json: JString,
+    strip_think: jboolean,
+) -> jstring {
+    let messages = jstr(&mut env, &messages_json);
+    let strip = strip_think != 0;
+    guarded(&mut env, move || api_chat_messages(&messages, strip))
 }
 
 #[unsafe(no_mangle)]
@@ -728,6 +777,27 @@ pub unsafe extern "C" fn vibe_local_chat(prompt: *const c_char, strip_think: u8)
     to_c_string(api_chat(&prompt, strip_think != 0))
 }
 
+/// # Safety
+/// `config_json` must be a valid NUL-terminated C string containing a
+/// LoadRequest JSON object (path required; ctx 0/omitted = auto-size).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vibe_local_load_model(config_json: *const c_char) -> *mut c_char {
+    let cfg = unsafe { cstr_opt(config_json) }.unwrap_or_default();
+    to_c_string(api_load_model(&cfg))
+}
+
+/// # Safety
+/// `messages_json` must be a valid NUL-terminated C string containing a JSON
+/// array of OpenAI-style {"role","content"} messages.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vibe_local_chat_messages(
+    messages_json: *const c_char,
+    strip_think: u8,
+) -> *mut c_char {
+    let messages = unsafe { cstr_opt(messages_json) }.unwrap_or_default();
+    to_c_string(api_chat_messages(&messages, strip_think != 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,6 +865,70 @@ mod tests {
         assert_eq!(status["ok"], true);
         let stopped = api_stop_server();
         assert_eq!(stopped["ok"], true);
+    }
+
+    #[test]
+    fn load_model_and_chat_messages_via_api() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        temp_data_dir();
+        // Error envelopes: bad JSON, missing file, chat without a model.
+        let bad = parse(to_c_string(api_load_model("{not json")));
+        assert_eq!(bad["ok"], false);
+        let missing = parse(to_c_string(api_load_model(
+            r#"{"path":"/nonexistent/m.gguf","backend":"cpu","ngl":0}"#,
+        )));
+        assert_eq!(missing["ok"], false);
+        let no_model = parse(to_c_string(api_chat_messages(
+            r#"[{"role":"user","content":"hi"}]"#,
+            true,
+        )));
+        assert_eq!(no_model["ok"], false);
+        let bad_role = parse(to_c_string(api_chat_messages(
+            r#"[{"role":"tool","content":"x"}]"#,
+            true,
+        )));
+        assert_eq!(bad_role["ok"], false);
+        let empty = parse(to_c_string(api_chat_messages("[]", true)));
+        assert_eq!(empty["ok"], false);
+
+        // Builtin path: synthetic GGUF loads, multi-turn array stays intact.
+        if vibe_local_engine::supervisor::find_llama_server(None).is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny-Q4_K_M.gguf");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&vibe_local_core::gguf::GGUF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let key = b"general.architecture";
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        let val = b"llama";
+        bytes.extend_from_slice(&(val.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(val);
+        std::fs::write(&path, bytes).unwrap();
+        let cfg = json!({"path": path.to_string_lossy(), "backend": "cpu", "ngl": 0});
+        let loaded = parse(to_c_string(api_load_model(&cfg.to_string())));
+        assert_eq!(loaded["ok"], true, "{loaded}");
+        assert_eq!(loaded["data"]["engine"], "builtin-microeval");
+        let msgs = json!([
+            {"role": "system", "content": "You are a calculator."},
+            {"role": "user", "content": "What is 21 * 2?"}
+        ]);
+        let reply = parse(to_c_string(api_chat_messages(&msgs.to_string(), true)));
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert!(!reply["data"]["text"].as_str().unwrap().is_empty());
+        assert_eq!(reply["data"]["engine"], "builtin-microeval");
+        // Single user turn keeps the builtin arithmetic path.
+        let single = json!([{"role": "user", "content": "What is 21 * 2?"}]);
+        let reply = parse(to_c_string(api_chat_messages(&single.to_string(), true)));
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert!(reply["data"]["text"].as_str().unwrap().contains("42"));
+        let unloaded = api_unload();
+        assert_eq!(unloaded["ok"], true);
     }
 
     #[test]

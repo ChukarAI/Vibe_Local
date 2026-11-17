@@ -45,6 +45,10 @@ pub enum ClusterCommand {
         /// Override the <30% battery pause (thermal guards are never overridable)
         #[arg(long)]
         battery_guard_off: bool,
+        /// Capability labels to advertise, comma-separated
+        /// (llm,vision,stt,tts,image_gen,video_gen,embed_rag); empty = auto-detect
+        #[arg(long, value_delimiter = ',')]
+        capabilities: Vec<String>,
     },
     /// Compute the MoE expert/RAM shard map across the live fleet
     PlanMoe {
@@ -80,6 +84,21 @@ pub enum ClusterCommand {
         no_wait: bool,
         #[arg(long, default_value_t = 600)]
         timeout: u64,
+        /// Only lease this job's tasks to nodes advertising this capability
+        #[arg(long)]
+        required_capability: Option<String>,
+    },
+    /// Show the fleet capability directory (heterogeneous routing)
+    Capabilities {
+        #[arg(long, default_value = "http://127.0.0.1:7900")]
+        coordinator: String,
+        #[arg(long, default_value = "")]
+        key: String,
+    },
+    /// Find Vibe Grid coordinators on the LAN via UDP broadcast
+    Discover {
+        #[arg(long, default_value_t = 1500)]
+        timeout_ms: u64,
     },
     /// Fleet + job overview
     Status {
@@ -179,6 +198,7 @@ pub fn run(cmd: ClusterCommand) -> anyhow::Result<()> {
             name,
             node_id_file,
             battery_guard_off,
+            capabilities,
         } => {
             let handle = agent::start_agent(agent::AgentConfig {
                 coordinator: coordinator.clone(),
@@ -187,6 +207,7 @@ pub fn run(cmd: ClusterCommand) -> anyhow::Result<()> {
                 node_id_file,
                 battery_guard_off,
                 workers,
+                capabilities,
                 ..Default::default()
             })?;
             println!(
@@ -234,6 +255,7 @@ pub fn run(cmd: ClusterCommand) -> anyhow::Result<()> {
             out,
             no_wait,
             timeout,
+            required_capability,
         } => {
             let base = coordinator.trim_end_matches('/').to_string();
             let mut numeric = BTreeMap::new();
@@ -255,6 +277,9 @@ pub fn run(cmd: ClusterCommand) -> anyhow::Result<()> {
                 }
             }
             let mut body = json!({"kind": preset, "params": numeric, "meta": meta, "replicate": replicate, "priority": priority});
+            if let Some(cap) = &required_capability {
+                body["required_capability"] = json!(cap);
+            }
             if let Some(path) = &input {
                 let bytes = std::fs::read(path)?;
                 use base64::Engine;
@@ -335,6 +360,66 @@ pub fn run(cmd: ClusterCommand) -> anyhow::Result<()> {
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
+        }
+        ClusterCommand::Capabilities { coordinator, key } => {
+            let dir = get_json(
+                coordinator.trim_end_matches('/'),
+                "/api/v1/capabilities",
+                &key,
+            )?;
+            let Some(groups) = dir["capabilities"].as_object() else {
+                println!("No capability groups reported.");
+                return Ok(());
+            };
+            if groups.is_empty() {
+                println!("No online nodes.");
+                return Ok(());
+            }
+            for (cap, nodes) in groups {
+                println!("{cap}:");
+                for n in nodes.as_array().unwrap_or(&Vec::new()) {
+                    let state = if n["available"].as_bool().unwrap_or(false) {
+                        "ready"
+                    } else {
+                        n["paused"].as_str().unwrap_or("paused")
+                    };
+                    println!(
+                        "  {} ({}) · {} · speed ×{:.2} · {} · models: {}",
+                        n["name"].as_str().unwrap_or("?"),
+                        n["node_id"].as_str().unwrap_or("?"),
+                        n["lan_endpoint"].as_str().unwrap_or(""),
+                        n["speed_factor"].as_f64().unwrap_or(0.0),
+                        state,
+                        n["loaded_models"]
+                            .as_array()
+                            .map(|ms| ms
+                                .iter()
+                                .map(|m| m.as_str().unwrap_or("?"))
+                                .collect::<Vec<_>>()
+                                .join(", "))
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            Ok(())
+        }
+        ClusterCommand::Discover { timeout_ms } => {
+            let found = vibe_local_cluster::grid_discovery::discover(Duration::from_millis(
+                timeout_ms.clamp(200, 10_000),
+            ));
+            if found.is_empty() {
+                println!("No Vibe Grid coordinators answered on the LAN.");
+                return Ok(());
+            }
+            for v in &found {
+                println!(
+                    "vibe-grid v{} at http://{}:{}",
+                    v["version"].as_str().unwrap_or("?"),
+                    v["host"].as_str().unwrap_or("?"),
+                    v["coordinator_port"].as_u64().unwrap_or(0),
+                );
+            }
+            Ok(())
         }
         ClusterCommand::Status {
             coordinator,

@@ -517,6 +517,11 @@ impl Queue {
                     if !Self::can_execute(n, &qt.task) {
                         continue;
                     }
+                    if let Some(cap) = &js.j.required_capability
+                        && !n.caps.capabilities.iter().any(|c| c == cap)
+                    {
+                        continue;
+                    }
                     if !Self::can_confirm_replica(&inner, js, qt, n) {
                         continue;
                     }
@@ -1009,6 +1014,57 @@ impl Queue {
         }
     }
 
+    /// Capability directory for heterogeneous routing (Vibe Router): online
+    /// nodes grouped by advertised capability. `lan_endpoint` is the node's
+    /// Vibe-Link convention address (http://<node-ip>:20129); `available`
+    /// is false while a battery/thermal guard or user pause is active.
+    /// Nodes without capability labels appear under "compute".
+    pub fn capability_directory(&self) -> serde_json::Value {
+        let inner = self.inner.lock().unwrap();
+        let now = Instant::now();
+        let mut groups: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+        for n in inner.nodes.values() {
+            if now.duration_since(n.seen) >= OFFLINE_AFTER {
+                continue;
+            }
+            let mut paused = n.paused.clone();
+            let r = n.guard_reason();
+            if !r.is_empty() {
+                paused = r;
+            }
+            let lan_endpoint = if n.remote_ip.is_empty() {
+                String::new()
+            } else {
+                format!("http://{}:20129", n.remote_ip)
+            };
+            let entry = serde_json::json!({
+                "node_id": n.id,
+                "name": n.name,
+                "ip": n.remote_ip,
+                "lan_endpoint": lan_endpoint,
+                "speed_factor": n.speed_factor,
+                "paused": paused,
+                "available": paused.is_empty(),
+                "battery_pct": n.caps.battery_pct,
+                "on_battery": n.caps.on_battery,
+                "temp_c": n.caps.temp_c,
+                "loaded_models": n.caps.loaded_models,
+                "running": n.running,
+            });
+            if n.caps.capabilities.is_empty() {
+                groups.entry("compute".into()).or_default().push(entry);
+            } else {
+                for cap in &n.caps.capabilities {
+                    groups.entry(cap.clone()).or_default().push(entry.clone());
+                }
+            }
+        }
+        serde_json::json!({
+            "version": crate::proto::VERSION,
+            "capabilities": groups,
+        })
+    }
+
     pub fn assemble_inputs(&self, job_id: &str) -> Option<AssembleInputs> {
         let inner = self.inner.lock().unwrap();
         let js = inner.jobs.get(job_id)?;
@@ -1338,6 +1394,66 @@ mod tests {
         let snap = q.snapshot();
         assert_eq!(snap.jobs[0].status, JOB_QUEUED);
         assert_eq!(snap.jobs[0].tasks_done, 0);
+    }
+
+    #[test]
+    fn capability_targeted_job_only_leases_to_matching_nodes() {
+        let q = Queue::new();
+        let mut llm_caps = caps();
+        llm_caps.capabilities = vec!["llm".into()];
+        llm_caps.loaded_models = vec!["qwen2.5-7b".into()];
+        let gpu = q.join("gpu-pc", llm_caps.clone());
+        let gpu2 = q.join("gpu-2", llm_caps);
+        let phone = q.join("phone", caps());
+        let mut j = job("j1");
+        j.required_capability = Some("llm".into());
+        q.add_job(j, vec![task("j1", "t1", 10)]);
+        // General-compute node never sees the capability-targeted task.
+        assert!(q.lease(&phone, "").is_none());
+        // Paused capability node gets nothing either.
+        assert!(q.lease(&gpu2, "user pause").is_none());
+        let t = q.lease(&gpu, "").unwrap();
+        assert_eq!(t.id, "t1");
+        // Untargeted jobs still flow to every node.
+        q.add_job(job("j2"), vec![task("j2", "t2", 10)]);
+        assert_eq!(q.lease(&phone, "").unwrap().id, "t2");
+    }
+
+    #[test]
+    fn capability_directory_groups_and_guards() {
+        let q = Queue::new();
+        let mut c = caps();
+        c.capabilities = vec!["llm".into(), "embed_rag".into()];
+        c.loaded_models = vec!["m1".into()];
+        q.join_with_meta("gpu", "uuid-a", "192.168.1.50", c);
+        q.join_with_meta("phone", "uuid-b", "192.168.1.60", caps());
+        let dir = q.capability_directory();
+        let llm = dir["capabilities"]["llm"].as_array().unwrap();
+        assert_eq!(llm.len(), 1);
+        assert_eq!(llm[0]["lan_endpoint"], "http://192.168.1.50:20129");
+        assert_eq!(llm[0]["loaded_models"][0], "m1");
+        assert!(llm[0]["available"].as_bool().unwrap());
+        assert_eq!(
+            dir["capabilities"]["embed_rag"].as_array().unwrap().len(),
+            1
+        );
+        // Capability-less nodes land in the general "compute" group.
+        assert_eq!(dir["capabilities"]["compute"].as_array().unwrap().len(), 1);
+        // Battery guard flips availability without removing the node.
+        let mut low = caps();
+        low.capabilities = vec!["llm".into()];
+        low.battery_pct = 15;
+        low.on_battery = true;
+        q.join_with_meta("low-batt", "uuid-c", "192.168.1.70", low);
+        let dir = q.capability_directory();
+        let llm = dir["capabilities"]["llm"].as_array().unwrap();
+        assert_eq!(llm.len(), 2);
+        let guarded = llm
+            .iter()
+            .find(|n| n["ip"] == "192.168.1.70")
+            .expect("guarded node present");
+        assert!(!guarded["available"].as_bool().unwrap());
+        assert!(guarded["paused"].as_str().unwrap().contains("battery 15%"));
     }
 
     #[test]

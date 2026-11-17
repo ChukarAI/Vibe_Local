@@ -77,10 +77,12 @@ pub struct Throughput {
     pub ttft_ms: f64,
     #[serde(default)]
     pub peak_ram_mb: f64,
+    /// `None` (JSON null) when VRAM was not measured — never a fabricated 0.
     #[serde(default)]
-    pub peak_vram_mb: f64,
+    pub peak_vram_mb: Option<f64>,
+    /// `None` (JSON null) when no thermal sensor reading was available.
     #[serde(default)]
-    pub thermal_delta_c: f64,
+    pub thermal_delta_c: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,7 +105,7 @@ pub struct CatalogEntry {
     #[serde(default)]
     pub context_length: u64,
     pub hardware_profile: String,
-    /// "seed_estimate" | "measured" | "submitted"
+    /// "seed_estimate" | "throughput_only" | "submitted" | "measured"
     pub provenance: String,
     #[serde(default)]
     pub source_url: String,
@@ -160,7 +162,9 @@ impl CatalogEntry {
         if self.active_params_b > self.total_params_b + 1e-9 {
             anyhow::bail!("active params cannot exceed total params");
         }
-        if !["seed_estimate", "measured", "submitted"].contains(&self.provenance.as_str()) {
+        if !["seed_estimate", "throughput_only", "submitted", "measured"]
+            .contains(&self.provenance.as_str())
+        {
             anyhow::bail!("invalid provenance '{}'", self.provenance);
         }
         if !self.download_url.is_empty()
