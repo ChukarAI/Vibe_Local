@@ -96,6 +96,31 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return is_public_v4(v4);
     }
+    // 6to4 (2002::/16) embeds the real IPv4 in segments 1-2; a 6to4 relay
+    // would route it to that address, so classify the embedded v4.
+    if seg[0] == 0x2002 {
+        let v4 = Ipv4Addr::new(
+            (seg[1] >> 8) as u8,
+            seg[1] as u8,
+            (seg[2] >> 8) as u8,
+            seg[2] as u8,
+        );
+        return is_public_v4(v4);
+    }
+    // Teredo (2001:0000::/32) tunnels IPv4 over UDP — reject outright.
+    if seg[0] == 0x2001 && seg[1] == 0x0000 {
+        return false;
+    }
+    // NAT64 well-known prefix (64:ff9b::/96) embeds IPv4 in the low 32 bits.
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6].iter().all(|s| *s == 0) {
+        let v4 = Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            seg[6] as u8,
+            (seg[7] >> 8) as u8,
+            seg[7] as u8,
+        );
+        return is_public_v4(v4);
+    }
     // Documentation 2001:db8::/32.
     if seg[0] == 0x2001 && seg[1] == 0x0db8 {
         return false;
@@ -258,16 +283,31 @@ pub fn discover(query: &str, max_repos: usize) -> anyhow::Result<Vec<DiscoveredF
 }
 
 /// Download a validated HF URL to `dest` (atomic temp-file + rename).
-/// Returns bytes written. Streams with a 16GB ceiling.
+/// Returns bytes written. Streams with a 16GB ceiling — exceeding it is an
+/// error, never a silently truncated model file.
 pub fn download(url: &str, dest: &Path) -> anyhow::Result<u64> {
+    const CEILING: u64 = 16 * 1024 * 1024 * 1024;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let resp = get_validated(url, 600)?;
     let tmp = dest.with_extension("gguf.part");
-    let mut reader = resp.into_reader().take(16 * 1024 * 1024 * 1024);
+    // Read one byte past the ceiling so truncation is detectable.
+    let mut reader = resp.into_reader().take(CEILING + 1);
     let mut file = std::fs::File::create(&tmp)?;
-    let written = std::io::copy(&mut reader, &mut file)?;
+    let written = match std::io::copy(&mut reader, &mut file) {
+        Ok(w) => w,
+        Err(e) => {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+    };
+    if written > CEILING {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!("download exceeds the 16GB ceiling");
+    }
     file.sync_all()?;
     drop(file);
     std::fs::rename(&tmp, dest)?;
@@ -308,6 +348,21 @@ mod tests {
         assert!(!is_public_ip("fd00::1".parse().unwrap()));
         assert!(!is_public_ip("::ffff:127.0.0.1".parse().unwrap()));
         assert!(is_public_ip("2606:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv6_transition_mechanisms_classified() {
+        // 6to4 embeds IPv4 in 2002:<v4>::/48 — relays route to that v4.
+        assert!(!is_public_ip("2002:7f00::".parse().unwrap())); // 127.0.0.1
+        assert!(!is_public_ip("2002:c0a8:101::".parse().unwrap())); // 192.168.1.1
+        assert!(is_public_ip("2002:808:808::".parse().unwrap())); // 8.8.8.8
+        // Teredo tunnels IPv4 over UDP — never trust it.
+        assert!(!is_public_ip(
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2".parse().unwrap()
+        ));
+        // NAT64 well-known prefix embeds IPv4 in the low 32 bits.
+        assert!(!is_public_ip("64:ff9b::7f00:1".parse().unwrap())); // 127.0.0.1
+        assert!(is_public_ip("64:ff9b::808:808".parse().unwrap())); // 8.8.8.8
     }
 
     #[test]

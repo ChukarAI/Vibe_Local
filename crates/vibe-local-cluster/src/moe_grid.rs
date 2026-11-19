@@ -565,15 +565,20 @@ pub fn page_in_experts(
             continue;
         }
         // Stacked expert tensor: split evenly across routed experts.
+        // Saturating throughout: hostile dims/offsets must not wrap into
+        // plausible-looking slice ranges.
         let n_elems = tensor.n_elements();
         let bytes_per_elem = quant_tensor_bytes(tensor.ty);
-        let tensor_bytes = n_elems * bytes_per_elem;
+        let tensor_bytes = n_elems.saturating_mul(bytes_per_elem);
         let per_expert = tensor_bytes / u64::from(routed_experts.max(1));
         if per_expert == 0 {
             continue;
         }
-        let start = info.data_offset + tensor.offset + per_expert * u64::from(expert_start);
-        let len = per_expert * u64::from(expert_end - expert_start);
+        let start = info
+            .data_offset
+            .saturating_add(tensor.offset)
+            .saturating_add(per_expert.saturating_mul(u64::from(expert_start)));
+        let len = per_expert.saturating_mul(u64::from(expert_end - expert_start));
         let len = len.min(info.file_size_bytes.saturating_sub(start));
         if len == 0 {
             continue;

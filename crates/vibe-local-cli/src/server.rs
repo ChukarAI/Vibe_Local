@@ -16,7 +16,7 @@ use vibe_local_core::catalog::{self, CatalogEntry};
 use vibe_local_core::db::SharedDb;
 use vibe_local_core::hardware::HardwareProbe;
 use vibe_local_core::{hf_crawler, recommender, util};
-use vibe_local_engine::{Engine, LoadRequest};
+use vibe_local_engine::{ChatMessage, Engine, LoadRequest};
 
 pub const DEFAULT_PORT: u16 = 20129;
 const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
@@ -163,7 +163,10 @@ fn read_body(request: &mut Request) -> anyhow::Result<String> {
 fn query_param(url: &str, key: &str) -> Option<String> {
     let query = url.split_once('?')?.1;
     for pair in query.split('&') {
-        let (k, v) = pair.split_once('=')?;
+        // Valueless pairs (?flag&key=v) must not abort the scan.
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
         if k == key {
             return Some(urldecode(v));
         }
@@ -236,6 +239,34 @@ fn csrf_ok(request: &Request) -> bool {
         || request_header(request, "X-Vibe-Admin").as_deref() == Some("1")
 }
 
+/// DNS-rebinding defense: the Host header must name this machine — an IP
+/// literal, `localhost`, or the local hostname (optionally `.local`).
+/// Without this, a remote web page could resolve its own domain to
+/// 127.0.0.1 and read loopback API responses same-origin (no token needed
+/// in loopback mode).
+fn host_ok(request: &Request) -> bool {
+    let Some(host) = request_header(request, "Host") else {
+        return false;
+    };
+    let host = host.trim();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("") // [::1]:port
+    } else if host.matches(':').count() > 1 {
+        host // bare IPv6 literal
+    } else {
+        host.split(':').next().unwrap_or(host) // name:port
+    };
+    let name = name.trim_end_matches('.').to_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    if name.parse::<std::net::IpAddr>().is_ok() || name == "localhost" {
+        return true;
+    }
+    let hn = crate::discovery::local_hostname().to_lowercase();
+    name == hn || name == format!("{hn}.local")
+}
+
 // ---------------------------------------------------------------------------
 // Routing
 // ---------------------------------------------------------------------------
@@ -247,6 +278,14 @@ fn handle_request(mut request: Request, state: &AppState) {
 
     if state.stop.load(Ordering::SeqCst) {
         let _ = request.respond(err_json(503, "server shutting down"));
+        return;
+    }
+
+    if !host_ok(&request) {
+        let _ = request.respond(err_json(
+            421,
+            "Host header must name this machine (IP, localhost or hostname) — DNS-rebinding guard",
+        ));
         return;
     }
 
@@ -391,6 +430,11 @@ fn route(
             let celsius = value["celsius"]
                 .as_f64()
                 .ok_or_else(|| anyhow::anyhow!("celsius required"))?;
+            // Same plausibility window as the JNI bridge: an absurd injected
+            // value (e.g. 1e300) would otherwise pause inference forever.
+            if !(-40.0..=125.0).contains(&celsius) {
+                return Ok(err_json(400, "implausible temperature"));
+            }
             state.config.engine.thermal().set_override(celsius);
             Ok(ok_json(json!({"ok": true})))
         }
@@ -432,20 +476,44 @@ fn route(
         (Method::Post, "/v1/chat/completions") => {
             let body = read_body(request)?;
             let value: serde_json::Value = serde_json::from_str(&body)?;
-            let prompt = extract_prompt(&value);
-            if prompt.trim().is_empty() {
-                return Ok(err_json(400, "messages must contain user content"));
-            }
             let strip = value["strip_think"].as_bool() == Some(true)
                 || request_header(request, "X-Vibe-Strip-Think").as_deref() == Some("1");
             let max_tokens = value["max_tokens"].as_u64().unwrap_or(512).min(8192) as u32;
-            let reply = state.config.engine.chat(&prompt, strip, max_tokens)?;
-            let model_id = state
-                .config
-                .engine
-                .status()?
-                .loaded_model
-                .unwrap_or_else(|| "vibe-local".into());
+            // The full OpenAI message array reaches llama-server unflattened
+            // (system role + multi-turn intact); the builtin fallback
+            // flattens internally and stays labeled builtin-microeval.
+            let reply = if let Some(arr) = value["messages"].as_array() {
+                let messages: Vec<ChatMessage> = arr
+                    .iter()
+                    .filter_map(|m| {
+                        Some(ChatMessage {
+                            role: m["role"].as_str()?.to_string(),
+                            content: m["content"].as_str().unwrap_or("").to_string(),
+                        })
+                    })
+                    .collect();
+                if messages.iter().all(|m| m.content.trim().is_empty()) {
+                    return Ok(err_json(400, "messages must contain user content"));
+                }
+                state
+                    .config
+                    .engine
+                    .chat_messages(messages, strip, max_tokens)?
+            } else {
+                let prompt = value["prompt"].as_str().unwrap_or("");
+                if prompt.trim().is_empty() {
+                    return Ok(err_json(400, "messages or prompt required"));
+                }
+                state.config.engine.chat(prompt, strip, max_tokens)?
+            };
+            // reply.model is captured at inference time — a follow-up
+            // status() would queue behind other chats and could time out.
+            let model_id = if reply.model.is_empty() {
+                "vibe-local".to_string()
+            } else {
+                reply.model.clone()
+            };
+            let prompt_text = extract_prompt(&value);
             let resp = json!({
                 "id": format!("chatcmpl-vibe-{}", util::unix_now()),
                 "object": "chat.completion",
@@ -457,9 +525,9 @@ fn route(
                     "finish_reason": "stop",
                 }],
                 "usage": {
-                    "prompt_tokens": vibe_local_engine::microeval::tokenize(&prompt).len(),
+                    "prompt_tokens": vibe_local_engine::microeval::tokenize(&prompt_text).len(),
                     "completion_tokens": reply.tokens_generated,
-                    "total_tokens": vibe_local_engine::microeval::tokenize(&prompt).len() as u64 + reply.tokens_generated,
+                    "total_tokens": vibe_local_engine::microeval::tokenize(&prompt_text).len() as u64 + reply.tokens_generated,
                 },
             });
             Ok(json_response(
@@ -518,6 +586,9 @@ fn route(
                 crate::grid_proxy::coordinator_base(query_param(url, "coordinator").as_deref());
             let key = request_header(request, "X-Compost-Key");
             let job_id = p.trim_start_matches("/api/grid/tiles/");
+            if !valid_job_id(job_id) {
+                return Ok(err_json(400, "invalid job id"));
+            }
             Ok(ok_json(crate::grid_proxy::fetch_json(
                 &base,
                 &format!("/api/v1/jobs/{job_id}/tiles"),
@@ -529,6 +600,9 @@ fn route(
                 crate::grid_proxy::coordinator_base(query_param(url, "coordinator").as_deref());
             let key = request_header(request, "X-Compost-Key");
             let job_id = p.trim_start_matches("/api/grid/artifact/");
+            if !valid_job_id(job_id) {
+                return Ok(err_json(400, "invalid job id"));
+            }
             let (bytes, ctype) = crate::grid_proxy::fetch_bytes(
                 &base,
                 &format!("/api/v1/jobs/{job_id}/artifact"),
@@ -557,6 +631,9 @@ fn route(
                 crate::grid_proxy::coordinator_base(query_param(url, "coordinator").as_deref());
             let key = request_header(request, "X-Compost-Key");
             let job_id = p.trim_start_matches("/api/grid/cancel/");
+            if !valid_job_id(job_id) {
+                return Ok(err_json(400, "invalid job id"));
+            }
             Ok(ok_json(crate::grid_proxy::post_json(
                 &base,
                 &format!("/api/v1/jobs/{job_id}/cancel"),
@@ -660,14 +737,19 @@ fn prewarm_route(request: &mut Request, state: &AppState) -> HttpResult {
     };
     let engine = Arc::clone(&state.config.engine);
     let flag = Arc::clone(&state.prewarm_running);
-    std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name("vibe-prewarm".into())
         .spawn(move || {
             if let Err(e) = engine.load(req) {
                 eprintln!("[vibe-prewarm] load failed: {e:#}");
             }
             flag.store(false, Ordering::SeqCst);
-        })?;
+        })
+    {
+        // Never leak the single-flight slot on a spawn failure.
+        state.prewarm_running.store(false, Ordering::SeqCst);
+        return Err(e.into());
+    }
     Ok(json_response(
         202,
         json!({"ok": true, "state": "loading"}),
@@ -683,6 +765,16 @@ impl ThroughputBackend for CatalogEntry {
             _ => "cpu".into(),
         }
     }
+}
+
+/// Coordinator job ids are `<prefix>-<seq>`; anything else could smuggle
+/// path segments or query strings into the proxied coordinator URL.
+fn valid_job_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn extract_prompt(value: &serde_json::Value) -> String {
@@ -958,6 +1050,130 @@ mod tests {
             .send_string("")
             .unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[test]
+    fn host_guard_rejects_dns_rebinding() {
+        let (_h, base) = test_state(false, None);
+        // A remote page resolving its own domain to 127.0.0.1 sends that
+        // domain as Host — must be rejected even in loopback (no-token) mode.
+        let err = ureq::get(&format!("{base}/api/status"))
+            .set("Host", "evil.com")
+            .call()
+            .unwrap_err();
+        assert!(matches!(err, ureq::Error::Status(421, _)));
+        // IP-literal Host (what ureq sends by default) passes.
+        let resp = ureq::get(&format!("{base}/api/status")).call().unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[test]
+    fn thermal_override_plausibility() {
+        let (_h, base) = test_state(false, None);
+        let err = ureq::post(&format!("{base}/api/thermal"))
+            .set("Content-Type", "application/json")
+            .send_json(json!({"celsius": 1e300}))
+            .unwrap_err();
+        assert!(matches!(err, ureq::Error::Status(400, _)));
+        let resp = ureq::post(&format!("{base}/api/thermal"))
+            .set("Content-Type", "application/json")
+            .send_json(json!({"celsius": 41.5}))
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[test]
+    fn query_param_skips_valueless_pairs() {
+        assert_eq!(
+            query_param(
+                "/x?flag&coordinator=http%3A%2F%2F127.0.0.1%3A7900",
+                "coordinator"
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:7900")
+        );
+        assert_eq!(query_param("/x?a&b", "b"), None);
+        assert_eq!(query_param("/x", "k"), None);
+    }
+
+    #[test]
+    fn grid_proxy_rejects_unsafe_job_ids() {
+        let (_h, base) = test_state(false, None);
+        let err = ureq::get(&format!("{base}/api/grid/tiles/bad%20id"))
+            .call()
+            .unwrap_err();
+        assert!(matches!(err, ureq::Error::Status(400, _)));
+        assert!(!valid_job_id("../state"));
+        assert!(!valid_job_id("a?b"));
+        assert!(valid_job_id("job-12"));
+    }
+
+    #[test]
+    fn chat_route_multi_turn_and_model_id() {
+        let (_h, base) = test_state(false, None);
+        if vibe_local_engine::supervisor::find_llama_server(None).is_some() {
+            return; // synthetic GGUF only loads in builtin mode
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m-Q4_K_M.gguf");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&vibe_local_core::gguf::GGUF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let key = b"general.architecture";
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        let val = b"llama";
+        bytes.extend_from_slice(&(val.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(val);
+        std::fs::write(&path, bytes).unwrap();
+        let path_str = path.to_string_lossy().into_owned();
+        ureq::post(&format!("{base}/api/load"))
+            .set("Content-Type", "application/json")
+            .send_json(json!({"path": path_str}))
+            .unwrap();
+        // Multi-turn array reaches the engine intact (builtin flattens and
+        // stays labeled); model id comes from the reply, not a status race.
+        let resp = ureq::post(&format!("{base}/v1/chat/completions"))
+            .set("Content-Type", "application/json")
+            .send_json(json!({"messages": [
+                {"role": "system", "content": "You are terse."},
+                {"role": "user", "content": "hello"}
+            ]}))
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.header("X-Vibe-Local-Engine"),
+            Some("builtin-microeval")
+        );
+        let v: serde_json::Value = resp.into_json().unwrap();
+        assert_eq!(v["model"].as_str(), Some(path_str.as_str()));
+        assert!(
+            !v["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        // Single user turn still hits the arithmetic path.
+        let resp = ureq::post(&format!("{base}/v1/chat/completions"))
+            .set("Content-Type", "application/json")
+            .send_json(json!({"messages": [{"role": "user", "content": "What is 21 * 2?"}]}))
+            .unwrap();
+        let v: serde_json::Value = resp.into_json().unwrap();
+        assert!(
+            v["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("42")
+        );
+        // Empty messages -> 400.
+        let err = ureq::post(&format!("{base}/v1/chat/completions"))
+            .set("Content-Type", "application/json")
+            .send_json(json!({"messages": []}))
+            .unwrap_err();
+        assert!(matches!(err, ureq::Error::Status(400, _)));
     }
 
     #[test]

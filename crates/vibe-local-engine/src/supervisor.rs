@@ -92,6 +92,10 @@ pub struct ChatReply {
     pub tok_per_sec: f64,
     pub backend: String,
     pub engine: String,
+    /// Path of the model that produced this reply (captured at inference
+    /// time, so callers never need a racy follow-up status query).
+    #[serde(default)]
+    pub model: String,
 }
 
 /// OpenAI-style chat message, passed through to llama-server unflattened.
@@ -642,6 +646,7 @@ fn chat_with(
         elapsed_secs: elapsed,
         backend: model.req.backend.clone(),
         engine: model.engine.clone(),
+        model: model.req.path.clone(),
     })
 }
 

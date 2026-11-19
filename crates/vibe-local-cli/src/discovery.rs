@@ -332,8 +332,14 @@ fn encode_name(name: &str, out: &mut Vec<u8>) {
         if label.is_empty() {
             continue;
         }
-        out.push(label.len() as u8);
-        out.extend_from_slice(label.as_bytes());
+        // DNS labels are capped at 63 bytes; a long hostname must not wrap
+        // the u8 length prefix into a malformed packet.
+        let mut end = label.len().min(63);
+        while !label.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push(end as u8);
+        out.extend_from_slice(&label.as_bytes()[..end]);
     }
     out.push(0);
 }
@@ -482,6 +488,16 @@ mod tests {
         p.extend_from_slice(&12u16.to_be_bytes()); // PTR
         p.extend_from_slice(&1u16.to_be_bytes()); // IN
         p
+    }
+
+    #[test]
+    fn long_hostname_label_truncated() {
+        // DNS labels cap at 63 bytes; the u8 length prefix must not wrap.
+        let long = "a".repeat(100);
+        let mut out = Vec::new();
+        encode_name(&format!("{long}.local"), &mut out);
+        assert_eq!(out[0], 63);
+        assert_eq!(out.len(), 1 + 63 + 1 + 5 + 1);
     }
 
     #[test]

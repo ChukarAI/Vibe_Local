@@ -61,7 +61,11 @@ pub struct GgufTensor {
 
 impl GgufTensor {
     pub fn n_elements(&self) -> u64 {
-        self.dims.iter().product::<u64>().max(1)
+        // Saturating: hostile dims must not wrap into a small byte count.
+        self.dims
+            .iter()
+            .fold(1u64, |acc, d| acc.saturating_mul(*d))
+            .max(1)
     }
 }
 
@@ -212,6 +216,13 @@ impl<R: Read> Reader<R> {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
     fn value(&mut self, ty: u32) -> anyhow::Result<GgufValue> {
+        self.value_depth(ty, 0)
+    }
+    fn value_depth(&mut self, ty: u32, depth: u32) -> anyhow::Result<GgufValue> {
+        // Hostile files can nest arrays arbitrarily; each level costs only
+        // 12 header bytes, so without a cap the 64MB budget permits millions
+        // of levels and overflows the stack.
+        anyhow::ensure!(depth <= 16, "GGUF array nesting too deep");
         Ok(match ty {
             0 => GgufValue::U8(self.u8()?),
             1 => GgufValue::I8(self.u8()? as i8),
@@ -230,7 +241,7 @@ impl<R: Read> Reader<R> {
                 }
                 let mut items = Vec::with_capacity(count.min(4096) as usize);
                 for _ in 0..count {
-                    items.push(self.value(elem_ty)?);
+                    items.push(self.value_depth(elem_ty, depth + 1)?);
                 }
                 GgufValue::Array(items)
             }
@@ -453,6 +464,41 @@ mod tests {
             buf.extend_from_slice(&off.to_le_bytes());
         }
         buf
+    }
+
+    #[test]
+    fn deep_array_nesting_rejected() {
+        // 20 levels of array-of-array: each level costs 12 header bytes, so
+        // without a depth cap a hostile file could overflow the stack.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensors
+        buf.extend_from_slice(&1u64.to_le_bytes()); // kv count
+        let key = b"x";
+        buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(&9u32.to_le_bytes()); // array
+        for _ in 0..20 {
+            buf.extend_from_slice(&9u32.to_le_bytes()); // elem type: array
+            buf.extend_from_slice(&1u64.to_le_bytes()); // count
+        }
+        buf.extend_from_slice(&4u32.to_le_bytes()); // innermost: u32
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&7u32.to_le_bytes());
+        let err = parse_reader(&buf[..]).unwrap_err();
+        assert!(err.to_string().contains("nesting"), "got: {err}");
+    }
+
+    #[test]
+    fn n_elements_saturates_on_hostile_dims() {
+        let t = GgufTensor {
+            name: "x".into(),
+            dims: vec![u64::MAX, 2],
+            ty: 0,
+            offset: 0,
+        };
+        assert_eq!(t.n_elements(), u64::MAX);
     }
 
     #[test]

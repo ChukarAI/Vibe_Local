@@ -70,7 +70,10 @@ fn linux_thermal_c() -> Option<f64> {
         if excluded || (!relevant && !kind.is_empty()) {
             continue;
         }
-        let raw = std::fs::read_to_string(entry.path().join("temp")).ok()?;
+        let raw = match std::fs::read_to_string(entry.path().join("temp")) {
+            Ok(raw) => raw,
+            Err(_) => continue, // one unreadable zone must not blind the rest
+        };
         let Ok(milli) = raw.trim().parse::<f64>() else {
             continue;
         };

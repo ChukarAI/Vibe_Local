@@ -144,6 +144,16 @@ fn resolve_target(
         .or_else(|| files.iter().find(|f| f.quant.as_deref() == Some("Q4_K_M")))
         .or_else(|| files.iter().find(|f| f.trusted))
         .unwrap_or(&files[0]);
+    // The filename comes from a remote API response: never let it escape
+    // the models directory (path separators or parent refs).
+    anyhow::ensure!(
+        !pick.filename.is_empty()
+            && !pick.filename.contains('/')
+            && !pick.filename.contains('\\')
+            && !pick.filename.contains(".."),
+        "unsafe filename from discovery: {:?}",
+        pick.filename
+    );
     let dest = models_dir.join(&pick.filename);
     if dest.is_file() {
         eprintln!("using cached {}", dest.display());

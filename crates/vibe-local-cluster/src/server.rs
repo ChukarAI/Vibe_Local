@@ -530,7 +530,10 @@ fn unauthorized() -> HttpResp {
 fn query_param(url: &str, key: &str) -> Option<String> {
     let query = url.split_once('?')?.1;
     for pair in query.split('&') {
-        let (k, v) = pair.split_once('=')?;
+        // Valueless pairs (?flag&key=v) must not abort the scan.
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
         if k == key {
             return Some(v.replace('+', " "));
         }
@@ -549,6 +552,32 @@ fn client_ip(req: &Request) -> String {
     req.remote_addr()
         .map(|a| a.ip().to_string())
         .unwrap_or_default()
+}
+
+/// DNS-rebinding defense (same rule as Vibe-Link): Host must be an IP
+/// literal, localhost, or this machine's hostname. Protects open fleets
+/// (no --key) from remote web pages resolving their domain to the LAN IP.
+fn host_ok(req: &Request) -> bool {
+    let Some(host) = req_header(req, "Host") else {
+        return false;
+    };
+    let host = host.trim();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else if host.matches(':').count() > 1 {
+        host
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    let name = name.trim_end_matches('.').to_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    if name.parse::<std::net::IpAddr>().is_ok() || name == "localhost" {
+        return true;
+    }
+    let hn = crate::node::hostname().to_lowercase();
+    name == hn || name == format!("{hn}.local")
 }
 
 /// Read the body, transparently decompressing gzip under a 9MiB cap.
@@ -602,6 +631,14 @@ fn handle_request(mut req: Request, coord: &Arc<Coordinator>) {
     let url = req.url().to_string();
     let path = url.split('?').next().unwrap_or("/").to_string();
     let method = req.method().clone();
+
+    if !host_ok(&req) {
+        let _ = req.respond(err_resp(
+            421,
+            "Host header must name this machine (IP, localhost or hostname)",
+        ));
+        return;
+    }
 
     // Body limits + gzip apply to every route.
     let body = if matches!(method, Method::Post) {

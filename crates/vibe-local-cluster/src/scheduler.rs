@@ -477,7 +477,10 @@ impl Queue {
         workers: usize,
     ) -> Vec<Task> {
         let workers = workers.max(1);
-        let want = (workers.saturating_sub(running)).max(1);
+        // A saturated node (running >= workers) gets nothing: forcing one
+        // extra lease per poll would queue tasks whose lease deadlines tick
+        // while they wait, causing spurious expiry failures under load.
+        let want = workers.saturating_sub(running);
         let mut inner = self.inner.lock().unwrap();
         let Some(n) = inner.nodes.get_mut(node_id) else {
             return Vec::new();
@@ -487,7 +490,7 @@ impl Queue {
         if !r.is_empty() {
             n.paused = r;
         }
-        if !n.paused.is_empty() {
+        if !n.paused.is_empty() || want == 0 {
             return Vec::new();
         }
         let now = Instant::now();
@@ -673,14 +676,16 @@ impl Queue {
                     .get(&res.node_id)
                     .map(|n| (n.uuid.clone(), n.remote_ip.clone()))
                     .unwrap_or_default();
+                // Capture before requeue: it moves the task to index 0,
+                // invalidating `idx` for everything that follows.
+                let kind = inner.tasks[idx].task.kind.clone();
+                let est = inner.tasks[idx].task.est_millis;
                 let qt = &mut inner.tasks[idx];
                 qt.pending_from = res.node_id.clone();
                 qt.pending_from_uuid = uuid;
                 qt.pending_from_ip = ip;
                 qt.replica_payload = Some(payload);
                 self.requeue(&mut inner, idx);
-                let kind = inner.tasks[idx].task.kind.clone();
-                let est = inner.tasks[idx].task.est_millis;
                 if let Some(n) = inner.nodes.get_mut(&res.node_id) {
                     n.running = n.running.saturating_sub(1);
                     if actual_ms > 0 {
@@ -817,14 +822,14 @@ impl Queue {
             inner.tasks[idx].deadline = None;
             return true;
         }
+        // Capture identity before requeue moves the task to index 0.
+        let task_id = inner.tasks[idx].task.id.clone();
+        let node_id = inner.tasks[idx].node_id.clone();
+        let next_attempt = inner.tasks[idx].attempts + 1;
         self.requeue(inner, idx);
         inner.requeued_total += 1;
         eprintln!(
-            "[task] {} {kind} on {} — retrying (attempt {}/{}): {cause}",
-            inner.tasks[idx].task.id,
-            inner.tasks[idx].node_id,
-            inner.tasks[idx].attempts + 1,
-            MAX_ATTEMPTS
+            "[task] {task_id} {kind} on {node_id} — retrying (attempt {next_attempt}/{MAX_ATTEMPTS}): {cause}"
         );
         true
     }
@@ -1585,6 +1590,56 @@ mod tests {
         // Mismatch requeues; after enough disagreements the job fails.
         let snap = q.snapshot();
         assert!(snap.jobs[0].tasks_done == 0);
+    }
+
+    #[test]
+    fn saturated_node_gets_no_lease() {
+        let q = Queue::new();
+        let n = q.join("pc", caps());
+        q.add_job(job("j1"), vec![task("j1", "t1", 10), task("j1", "t2", 10)]);
+        // running == workers: nothing may be leased (over-leasing would let
+        // queued tasks' deadlines expire while they wait for a free worker).
+        assert!(q.lease_batch(&n, "", 2, 2).is_empty());
+        assert!(q.lease_batch(&n, "", 5, 2).is_empty());
+        // One free slot -> exactly one task; two free -> both.
+        assert_eq!(q.lease_batch(&n, "", 1, 2).len(), 1);
+        assert_eq!(q.lease_batch(&n, "", 0, 2).len(), 1); // only t2 remains
+    }
+
+    #[test]
+    fn replica_first_result_learns_correct_task_speed() {
+        // Regression: requeue() moves the task to index 0; the speed sample
+        // must use the RESULT task's est_millis, not whatever lands at the
+        // old index afterwards.
+        let q = Queue::new();
+        let n1 = q.join_with_meta("a", "uuid-A", "10.0.0.1", caps());
+        let n2 = q.join_with_meta("b", "uuid-B", "10.0.0.2", caps());
+        let mut j = job("j1");
+        j.replicate = true;
+        q.add_job(j, vec![task("j1", "t0", 100), task("j1", "t1", 1000)]);
+        let t0 = q.lease(&n1, "").unwrap();
+        assert_eq!(t0.id, "t0");
+        let t1 = q.lease(&n2, "").unwrap();
+        assert_eq!(t1.id, "t1");
+        std::thread::sleep(Duration::from_millis(60));
+        q.result_in(ResultMsg {
+            task_id: "t1".into(),
+            node_id: n2.clone(),
+            lease_epoch: t1.lease_epoch,
+            data: Some(b"7".to_vec()),
+            millis: 50,
+            exec_millis: 50,
+            ..Default::default()
+        });
+        let snap = q.snapshot();
+        let b = snap.nodes.iter().find(|n| n.name == "b").unwrap();
+        // est 1000 / actual 50 = 20 → (20 + 3*1)/(1+3) = 5.75.
+        // The stale-index bug sampled t0's est (100/50=2 → 1.25) instead.
+        assert!(
+            (b.preset_speeds["primes"] - 5.75).abs() < 1e-9,
+            "factor {}",
+            b.preset_speeds["primes"]
+        );
     }
 
     #[test]

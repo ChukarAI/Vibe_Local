@@ -53,13 +53,16 @@ pub fn eval_arithmetic(expr: &str) -> Option<f64> {
     if tokens.is_empty() {
         return None;
     }
-    // Shunting-yard to RPN.
+    // Shunting-yard to RPN. Precedence is doubled so unary minus/plus can
+    // sit between multiplicative and power operators: `-2^2` = -(2^2) and
+    // `2^-3^2` = 2^(-(3^2)), matching mathematical convention.
     let mut output: Vec<String> = Vec::new();
     let mut ops: Vec<String> = Vec::new();
     let prec = |op: &str| match op {
-        "+" | "-" => 1,
-        "*" | "/" | "%" => 2,
-        "^" => 3,
+        "+" | "-" => 2,
+        "*" | "/" | "%" => 4,
+        "u-" | "u+" => 5,
+        "^" => 6,
         _ => 0,
     };
     let mut prev_was_operand = false;
@@ -93,9 +96,14 @@ pub fn eval_arithmetic(expr: &str) -> Option<f64> {
             }
             prev_was_operand = true;
         } else if matches!(tok.as_str(), "+" | "-" | "*" | "/" | "%" | "^") {
-            // Unary minus/plus.
+            // Unary minus/plus: prefix operators bind to the NEXT operand,
+            // so they never pop pending operators (popping `^` before a
+            // unary `-` would turn `2^-3` into `(2^0)-3`).
             if !prev_was_operand && (tok == "-" || tok == "+") {
                 output.push("0".to_string());
+                ops.push(format!("u{tok}"));
+                prev_was_operand = false;
+                continue;
             } else if !prev_was_operand {
                 return None;
             }
@@ -135,8 +143,8 @@ pub fn eval_arithmetic(expr: &str) -> Option<f64> {
         let b = stack.pop()?;
         let a = stack.pop()?;
         let v = match tok.as_str() {
-            "+" => a + b,
-            "-" => a - b,
+            "+" | "u+" => a + b,
+            "-" | "u-" => a - b,
             "*" => a * b,
             "/" => {
                 if b == 0.0 {
@@ -333,6 +341,24 @@ mod tests {
         assert_eq!(eval_arithmetic("2 3"), None);
         assert_eq!(eval_arithmetic("(2+3"), None);
         assert_eq!(eval_arithmetic(""), None);
+    }
+
+    #[test]
+    fn unary_after_operator() {
+        // Regression: unary minus/plus must bind to the next operand, not
+        // pop pending higher-precedence operators.
+        assert_eq!(eval_arithmetic("2*-3"), Some(-6.0));
+        assert_eq!(eval_arithmetic("2^-3"), Some(0.125));
+        assert_eq!(eval_arithmetic("10/-2"), Some(-5.0));
+        assert_eq!(eval_arithmetic("5--3"), Some(8.0));
+        assert_eq!(eval_arithmetic("5+-3"), Some(2.0));
+        assert_eq!(eval_arithmetic("2*-3^2"), Some(-18.0));
+        assert_eq!(eval_arithmetic("-2^2"), Some(-4.0));
+        assert_eq!(eval_arithmetic("2^-3^2"), Some(2f64.powf(-9.0)));
+        assert_eq!(eval_arithmetic("(-2+3)*4"), Some(4.0));
+        assert_eq!(eval_arithmetic("--3"), Some(3.0));
+        assert_eq!(eval_arithmetic("2^+3"), Some(8.0));
+        assert_eq!(eval_arithmetic("3+4*2/(1-5)^2"), Some(3.5));
     }
 
     #[test]
