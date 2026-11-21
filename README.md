@@ -188,10 +188,11 @@ python benchmarks/kaggle_10pillar_bench.py \
 ## Security model
 
 - **Loopback by default** (`127.0.0.1:20129`); LAN mode is opt-in and token-gated (constant-time comparison, CSPRNG-generated 32-hex tokens).
-- **SSRF-guarded downloads**: only `https://huggingface.co/` and verified HF CDN hosts; every URL is DNS-resolved and rejected if any address is loopback, link-local (`169.254.0.0/16`), RFC1918, ULA, CGNAT or multicast; redirects re-validated per hop (max 5).
+- **DNS-rebinding shield**: every request to Vibe-Link and the Vibe Grid coordinator must carry a `Host` header naming this machine — an IP literal, `localhost`, or the local hostname — so a remote web page cannot reach the tokenless loopback API by re-resolving its own domain to `127.0.0.1`.
+- **SSRF-guarded downloads**: only `https://huggingface.co/` and verified HF CDN hosts; every URL is DNS-resolved and rejected if any address is loopback, link-local (`169.254.0.0/16`), RFC1918, ULA, CGNAT, multicast or an IPv6 transition address (6to4/Teredo/NAT64 embedded IPv4); redirects re-validated per hop (max 5).
 - **Strict CSP** on all served assets; the leaderboard uses safe DOM construction only (`textContent`/`createElement`, zero `innerHTML`).
-- **Bounded resources**: 8MB request bodies, 64MB GGUF header budget, bounded engine command channel (16), 8 HTTP workers (slow routes can't starve status/chat), single-flight VibeMark + prewarm (`409` on overlap), 16GB download ceiling, idle auto-unload.
-- **Thermal safety**: inference pauses at ≥45°C and resumes below 43°C (hysteresis); throttles at ≥42°C. No sensor → honest `no_sensor` state, never fake temperatures.
+- **Bounded resources**: 8MB request bodies, 64MB GGUF header budget, GGUF parser array-depth caps, bounded engine command channel (16), 8 HTTP workers (slow routes can't starve status/chat), single-flight VibeMark + prewarm (`409` on overlap), 16GB download ceiling (exceeding it is an error, never a truncated model), idle auto-unload.
+- **Thermal safety**: inference pauses at ≥45°C and resumes below 43°C (hysteresis); throttles at ≥42°C. Injected readings are range-checked (−40…125°C). No sensor → honest `no_sensor` state, never fake temperatures.
 
 ## Repository layout
 

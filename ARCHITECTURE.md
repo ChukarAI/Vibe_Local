@@ -154,7 +154,7 @@ Real sensors: Linux/Android `/sys/class/thermal/thermal_zone*/temp` (CPU/SoC zon
 | `GET /`, `/leaderboard`, static assets | web UI with strict CSP + traversal protection |
 | `GET /catalog.json` | bundled seed catalog (or DB-synthesized) |
 
-**Security middleware**: LAN mode binds `0.0.0.0` and requires `X-Vibe-Local-Token` / `Bearer` (constant-time compare) on all `/api/*` + `/v1/*`; LAN without a token rejects everything; mutating POST/DELETE require `Content-Type: application/json` or `X-Vibe-Admin: 1`. Loopback mode binds `127.0.0.1` only. CSP: `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`. Bodies capped at 8MB.
+**Security middleware**: LAN mode binds `0.0.0.0` and requires `X-Vibe-Local-Token` / `Bearer` (constant-time compare) on all `/api/*` + `/v1/*`; LAN without a token rejects everything; mutating POST/DELETE require `Content-Type: application/json` or `X-Vibe-Admin: 1`. Every request must carry a `Host` naming this machine (IP literal, `localhost`, or the local hostname) — the DNS-rebinding guard; the Vibe Grid coordinator enforces the same rule. Loopback mode binds `127.0.0.1` only. CSP: `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`. Bodies capped at 8MB.
 
 ### 4.2 Discovery (`discovery.rs`)
 
@@ -395,14 +395,18 @@ JNI/C-ABI symbols are unchanged.
 
 ## 17. Wave 3 verification
 
-165 workspace tests pass: core 46, engine 20 (auto-context sizing, draft
-validation, multi-turn builtin chat), cluster 67 (capability wire
-compatibility, targeted leasing, capability directory + guards, UDP
-discovery responder/probe, end-to-end capability routing with unknown-label
-400), cli 27 (prewarm 202/200/409 + concurrent-VibeMark 409 under a live
-benchmark, UTF-8 truncation, mDNS multi-question/compression-pointer
-parsing, SO_REUSEADDR coexistence), jni 5 (loadModel/chatMessages error
-paths + builtin round-trip). Gates: `cargo fmt --all -- --check`,
-`cargo clippy --workspace --all-targets -- -D warnings`,
+177 workspace tests pass: core 49 (GGUF nesting-depth cap, saturating
+tensor math, IPv6 transition-mechanism SSRF classification), engine 21
+(auto-context sizing, draft validation, multi-turn builtin chat, unary
+arithmetic after operators), cluster 69 (capability wire compatibility,
+targeted leasing, capability directory + guards, saturated-node lease
+bounds, replica speed-learning identity, UDP discovery responder/probe,
+end-to-end capability routing with unknown-label 400), cli 33 (prewarm
+202/200/409 + concurrent-VibeMark 409 under a live benchmark, DNS-rebinding
+Host guard, thermal plausibility window, unsafe job-id rejection,
+multi-turn `/v1` chat with reply-carried model id, UTF-8 truncation, mDNS
+multi-question/compression-pointer parsing, SO_REUSEADDR coexistence), jni 5
+(loadModel/chatMessages error paths + builtin round-trip). Gates: `cargo fmt
+--all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace`, `python benchmarks/kaggle_10pillar_bench.py
 --self-test` (15/15).
