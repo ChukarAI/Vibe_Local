@@ -963,6 +963,7 @@ impl Queue {
     pub fn snapshot(&self) -> StateResponse {
         let inner = self.inner.lock().unwrap();
         let now = Instant::now();
+        let wall_now = SystemTime::now();
         let mut nodes = Vec::new();
         for n in inner.nodes.values() {
             let mut paused = n.paused.clone();
@@ -975,6 +976,15 @@ impl Queue {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.factor))
                 .collect();
+            // Reconstruct the wall-clock last-seen from the monotonic stamp:
+            // reporting `now` for every node would hide how stale a node is.
+            let seen_wall = wall_now
+                .checked_sub(n.seen.elapsed())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let last_seen = seen_wall
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             nodes.push(Node {
                 id: n.id.clone(),
                 node_uuid: n.uuid.clone(),
@@ -986,12 +996,7 @@ impl Queue {
                         .map(|d| d.as_secs())
                         .unwrap_or(0),
                 ),
-                last_seen: iso8601_from_unix(
-                    SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                ),
+                last_seen: iso8601_from_unix(last_seen),
                 online: now.duration_since(n.seen) < OFFLINE_AFTER,
                 rate: n.rate,
                 running: n.running,
@@ -1330,6 +1335,32 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn snapshot_preserves_node_last_seen_age() {
+        let q = Queue::new();
+        let id = q.join("pc", caps());
+        {
+            let mut inner = q.inner.lock().unwrap();
+            inner.nodes.get_mut(&id).unwrap().seen = Instant::now() - Duration::from_secs(5);
+        }
+        let expected = SystemTime::now()
+            .checked_sub(Duration::from_secs(5))
+            .unwrap()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let last_seen = q.snapshot().nodes[0].last_seen.clone();
+        assert!(
+            last_seen == iso8601_from_unix(expected)
+                || last_seen == iso8601_from_unix(expected.saturating_sub(1))
+        );
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_ne!(last_seen, iso8601_from_unix(now));
     }
 
     #[test]

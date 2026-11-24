@@ -385,12 +385,17 @@ impl Coordinator {
             let art2 = Arc::clone(&art);
             let job_id = job_id.to_string();
             let disk_dir = self.artifact_disk_dir();
-            std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name(format!("grid-artifact-{job_id}"))
                 .spawn(move || {
                     build_artifact(queue, registry, cache, &job_id, &art2, disk_dir);
-                })
-                .ok()?;
+                });
+            if spawned.is_err() {
+                // Release the builder flag or every future request for this
+                // artifact waits out the full timeout with no builder.
+                art.building.store(false, Ordering::SeqCst);
+                return None;
+            }
         }
         if art.wait(ARTIFACT_WAIT_CLIENT) {
             Some(art)
@@ -527,6 +532,35 @@ fn unauthorized() -> HttpResp {
         .with_header(header("WWW-Authenticate", "Key realm=\"compost\""))
 }
 
+fn urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                if let Ok(b) = u8::from_str_radix(hex, 16) {
+                    out.push(b);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn query_param(url: &str, key: &str) -> Option<String> {
     let query = url.split_once('?')?.1;
     for pair in query.split('&') {
@@ -534,8 +568,8 @@ fn query_param(url: &str, key: &str) -> Option<String> {
         let Some((k, v)) = pair.split_once('=') else {
             continue;
         };
-        if k == key {
-            return Some(v.replace('+', " "));
+        if urldecode(k) == key {
+            return Some(urldecode(v));
         }
     }
     None
@@ -1191,6 +1225,24 @@ mod tests {
             req = req.set(auth::HEADER, k);
         }
         req.send_json(body).unwrap()
+    }
+
+    #[test]
+    fn query_param_percent_decodes_keys_and_values() {
+        assert_eq!(
+            query_param("/x?flag&key=a%20b+c", "key").as_deref(),
+            Some("a b c")
+        );
+        assert_eq!(
+            query_param("/x?%6bey=%2Ftmp%2Fa", "key").as_deref(),
+            Some("/tmp/a")
+        );
+        assert_eq!(query_param("/x?key=100%25", "key").as_deref(), Some("100%"));
+        assert_eq!(
+            query_param("/x?key=bad%ZZ", "key").as_deref(),
+            Some("bad%ZZ")
+        );
+        assert_eq!(query_param("/x?flag&key=v", "flag"), None);
     }
 
     #[test]

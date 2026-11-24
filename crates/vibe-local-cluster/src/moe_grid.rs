@@ -506,6 +506,16 @@ pub fn reroute_after_drop(
             }
         }
     }
+    if plan.backbone_node != failed_node {
+        // Shards that paged onto the failed coordinator during reroute are
+        // pinned to the old backbone id; they must follow the promotion.
+        let new_backbone = plan.backbone_node.clone();
+        for s in plan.shards.iter_mut() {
+            if s.node_id == failed_node {
+                s.node_id = new_backbone.clone();
+            }
+        }
+    }
     let _ = expert_mb;
     events
 }
@@ -813,6 +823,25 @@ mod tests {
         router.on_node_drop("n1", &surviving);
         assert_eq!(router.plan.backbone_node, "n2");
         assert_eq!(router.plan.expert_coverage(), 64);
+        assert!(router.plan.shards.iter().all(|s| s.node_id != "n1"));
+    }
+
+    #[test]
+    fn host_paging_follows_backbone_promotion() {
+        let nodes = vec![pc(), phone("n2", 1200, 0.8)];
+        let plan = plan_moe(&olmoe(), &nodes, "Q4_K_M", 4096, 5.0).unwrap();
+        let mut router = MoeGridRouter::new(plan, olmoe(), "Q4_K_M");
+        let surviving = vec![phone("n2", 1200, 0.8)];
+        router.on_node_drop("n1", &surviving);
+        assert_eq!(router.plan.backbone_node, "n2");
+        assert!(
+            router
+                .plan
+                .shards
+                .iter()
+                .any(|s| { s.role == ShardRole::HostPaging && s.node_id == "n2" })
+        );
+        assert!(router.plan.shards.iter().all(|s| s.node_id != "n1"));
     }
 
     #[test]

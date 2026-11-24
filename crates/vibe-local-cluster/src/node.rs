@@ -124,6 +124,30 @@ pub fn detect() -> Caps {
     caps
 }
 
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn battery_from_sysfs(
+    entries: impl IntoIterator<Item = std::path::PathBuf>,
+) -> Option<(i32, bool)> {
+    for path in entries {
+        let kind = std::fs::read_to_string(path.join("type")).unwrap_or_default();
+        if kind.trim() != "Battery" {
+            continue;
+        }
+        // Missing or malformed capacity on one battery must not abort the
+        // scan of the remaining batteries.
+        let Ok(cap) = std::fs::read_to_string(path.join("capacity")) else {
+            continue;
+        };
+        let Ok(pct) = cap.trim().parse::<i32>() else {
+            continue;
+        };
+        let status = std::fs::read_to_string(path.join("status")).unwrap_or_default();
+        let charging = matches!(status.trim(), "Charging" | "Full");
+        return Some((pct, charging));
+    }
+    None
+}
+
 /// Battery (percent, charging). Windows GetSystemPowerStatus, Linux/Android
 /// sysfs power_supply. None when there is no battery.
 pub fn battery() -> Option<(i32, bool)> {
@@ -156,19 +180,11 @@ pub fn battery() -> Option<(i32, bool)> {
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        let entries = std::fs::read_dir("/sys/class/power_supply").ok()?;
-        for e in entries.flatten() {
-            let kind = std::fs::read_to_string(e.path().join("type")).unwrap_or_default();
-            if kind.trim() != "Battery" {
-                continue;
-            }
-            let cap = std::fs::read_to_string(e.path().join("capacity")).ok()?;
-            let pct: i32 = cap.trim().parse().ok()?;
-            let status = std::fs::read_to_string(e.path().join("status")).unwrap_or_default();
-            let charging = matches!(status.trim(), "Charging" | "Full");
-            return Some((pct, charging));
-        }
-        None
+        let entries = std::fs::read_dir("/sys/class/power_supply")
+            .ok()?
+            .flatten()
+            .map(|e| e.path());
+        battery_from_sysfs(entries)
     }
     #[cfg(target_os = "macos")]
     {
@@ -431,6 +447,26 @@ fn mac_addresses() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn battery_scan_skips_unreadable_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let malformed = dir.path().join("malformed");
+        let valid = dir.path().join("valid");
+        for path in [&missing, &malformed, &valid] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("type"), "Battery\n").unwrap();
+        }
+        std::fs::write(malformed.join("capacity"), "unknown\n").unwrap();
+        std::fs::write(valid.join("capacity"), "73\n").unwrap();
+        std::fs::write(valid.join("status"), "Charging\n").unwrap();
+        assert_eq!(
+            battery_from_sysfs([missing, malformed, valid]),
+            Some((73, true))
+        );
+        assert_eq!(battery_from_sysfs(std::iter::empty()), None);
+    }
 
     #[test]
     fn benchmark_is_sane() {

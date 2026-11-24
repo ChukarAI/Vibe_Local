@@ -151,13 +151,27 @@ fn err_json(status: u16, message: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     json_response(status, json!({"ok": false, "error": message}), &[])
 }
 
+#[derive(Debug)]
+struct BodyTooLarge;
+
+impl std::fmt::Display for BodyTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "body exceeds {MAX_BODY_BYTES} bytes")
+    }
+}
+
+impl std::error::Error for BodyTooLarge {}
+
 fn read_body(request: &mut Request) -> anyhow::Result<String> {
-    let mut buf = String::new();
+    let mut buf = Vec::new();
     request
         .as_reader()
-        .take(MAX_BODY_BYTES)
-        .read_to_string(&mut buf)?;
-    Ok(buf)
+        .take(MAX_BODY_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_BODY_BYTES {
+        return Err(BodyTooLarge.into());
+    }
+    Ok(String::from_utf8(buf)?)
 }
 
 fn query_param(url: &str, key: &str) -> Option<String> {
@@ -167,7 +181,7 @@ fn query_param(url: &str, key: &str) -> Option<String> {
         let Some((k, v)) = pair.split_once('=') else {
             continue;
         };
-        if k == key {
+        if urldecode(k) == key {
             return Some(urldecode(v));
         }
     }
@@ -289,6 +303,20 @@ fn handle_request(mut request: Request, state: &AppState) {
         return;
     }
 
+    if matches!(
+        method,
+        Method::Post | Method::Put | Method::Delete | Method::Patch
+    ) && request_header(&request, "Content-Length")
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|n| n > MAX_BODY_BYTES)
+    {
+        let _ = request.respond(err_json(
+            413,
+            &format!("body exceeds {MAX_BODY_BYTES} bytes"),
+        ));
+        return;
+    }
+
     // Static UI is public even in LAN mode (no secrets in the bundle);
     // every API/v1 route is token-gated when LAN is enabled.
     let is_api = path.starts_with("/api/") || path.starts_with("/v1/");
@@ -311,6 +339,9 @@ fn handle_request(mut request: Request, state: &AppState) {
     let result = route(&mut request, state, &path, &method, &url);
     let response = match result {
         Ok(resp) => resp,
+        Err(e) if e.downcast_ref::<BodyTooLarge>().is_some() => {
+            err_json(413, &format!("body exceeds {MAX_BODY_BYTES} bytes"))
+        }
         Err(e) => err_json(500, &format!("{e:#}")),
     };
     let _ = request.respond(response);
@@ -1083,6 +1114,16 @@ mod tests {
     }
 
     #[test]
+    fn oversized_body_is_rejected() {
+        let (_h, base) = test_state(false, None);
+        let err = ureq::post(&format!("{base}/api/idle"))
+            .set("Content-Type", "application/json")
+            .send_bytes(&vec![b' '; MAX_BODY_BYTES as usize + 1])
+            .unwrap_err();
+        assert!(matches!(err, ureq::Error::Status(413, _)));
+    }
+
+    #[test]
     fn query_param_skips_valueless_pairs() {
         assert_eq!(
             query_param(
@@ -1093,6 +1134,10 @@ mod tests {
             Some("http://127.0.0.1:7900")
         );
         assert_eq!(query_param("/x?a&b", "b"), None);
+        assert_eq!(
+            query_param("/x?%71uery=hello+world", "query").as_deref(),
+            Some("hello world")
+        );
         assert_eq!(query_param("/x", "k"), None);
     }
 

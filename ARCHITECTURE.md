@@ -395,17 +395,20 @@ JNI/C-ABI symbols are unchanged.
 
 ## 17. Wave 3 verification
 
-177 workspace tests pass: core 49 (GGUF nesting-depth cap, saturating
+182 workspace tests pass: core 49 (GGUF nesting-depth cap, saturating
 tensor math, IPv6 transition-mechanism SSRF classification), engine 21
 (auto-context sizing, draft validation, multi-turn builtin chat, unary
-arithmetic after operators), cluster 69 (capability wire compatibility,
+arithmetic after operators), cluster 73 (capability wire compatibility,
 targeted leasing, capability directory + guards, saturated-node lease
-bounds, replica speed-learning identity, UDP discovery responder/probe,
-end-to-end capability routing with unknown-label 400), cli 33 (prewarm
+bounds, replica speed-learning identity, monotonic-to-wall-clock last-seen
+reconstruction, unreadable-battery skipping, backbone-promotion host-paging
+re-pinning, percent-decoded query parameters, UDP discovery responder/probe,
+end-to-end capability routing with unknown-label 400), cli 34 (prewarm
 202/200/409 + concurrent-VibeMark 409 under a live benchmark, DNS-rebinding
 Host guard, thermal plausibility window, unsafe job-id rejection,
-multi-turn `/v1` chat with reply-carried model id, UTF-8 truncation, mDNS
-multi-question/compression-pointer parsing, SO_REUSEADDR coexistence), jni 5
+multi-turn `/v1` chat with reply-carried model id, UTF-8 truncation, 8 MiB
+body-limit 413 semantics, mDNS multi-question/compression-pointer parsing,
+SO_REUSEADDR coexistence), jni 5
 (loadModel/chatMessages error paths + builtin round-trip). Gates: `cargo fmt
 --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace`, `python benchmarks/kaggle_10pillar_bench.py
