@@ -261,10 +261,10 @@ pub fn cpu_model() -> String {
         let text = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
         for line in text.lines() {
             for key in ["model name", "Hardware", "Processor"] {
-                if let Some(v) = line.strip_prefix(key) {
-                    if let Some(v) = v.trim_start().strip_prefix(':') {
-                        return v.trim().to_string();
-                    }
+                if let Some(v) = line.strip_prefix(key)
+                    && let Some(v) = v.trim_start().strip_prefix(':')
+                {
+                    return v.trim().to_string();
                 }
             }
         }

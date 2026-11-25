@@ -74,7 +74,7 @@ pub enum ClusterCommand {
         coordinator: String,
         #[arg(long, default_value = "")]
         key: String,
-        /// Input file for wordcount / llm_batch
+        /// Input file for wordcount / llm_batch / embed_batch
         #[arg(long)]
         input: Option<PathBuf>,
         /// Write the finished artifact to this file

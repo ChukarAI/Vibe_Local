@@ -65,12 +65,28 @@ Every `/v1/*` response carries:
 
 Discovery: Vibe Router finds Vibe Local automatically via **mDNS** (`_vibe-local._tcp.local`) or a UDP probe (`VIBE_DISCOVER_V1` → port **20131**). In `--lan` mode every `/api/*` and `/v1/*` route requires the pre-shared `X-Vibe-Local-Token` (or `Authorization: Bearer`) header, and state-mutating requests additionally require `Content-Type: application/json` or `X-Vibe-Admin: 1`.
 
+### Embeddings: `POST /v1/embeddings`
+
+OpenAI-compatible embeddings for RAG pipelines, with the same LAN auth, body-limit (413) and Host-guard (421) enforcement as chat, and the same `X-Vibe-Router-Cost-Micros: 0` header:
+
+```bash
+curl http://127.0.0.1:20129/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"input":["first text","second text"]}'
+# → {"object":"list","data":[{"object":"embedding","index":0,"embedding":[…]},…],
+#    "model":"…","usage":{"prompt_tokens":…,"total_tokens":…}}
+```
+
+`input` accepts a single string or an array of strings (max 128). With llama-server the vectors are the loaded model's real embeddings (load with `"embedding": true`, see below); without it the builtin fallback serves deterministic, L2-normalized hash embeddings honestly labeled `builtin-microeval` — stable across calls and platforms, but **not** semantic model embeddings.
+
 ### Model loading: auto-context, speculative decoding, prewarm
 
 `POST /api/load` (and JNI `loadModel`) accept a `LoadRequest` JSON:
 
 - `ctx: 0` (or omitted) **auto-sizes the context window**: the largest GGUF-estimated window (2k/4k/8k/16k, capped at the model's trained length) whose RAM estimate fits live free VRAM (GPU offload) or free RAM (CPU), minus a 512MB safety margin.
 - `draft_model_path` (+ optional `draft_ngl`, `draft_max`, default 8) enables **native llama.cpp speculative decoding** via `--model-draft` / `--gpu-layers-draft` / `--draft-max`.
+- `mmproj_path` loads a **multimodal projector** GGUF via `--mmproj` for vision models. It is validated exactly like the draft model: the file must exist and carry a valid GGUF header, or the load is rejected before anything spawns. `GET /api/status` reports `mmproj_loaded`, and `GET /v1/models` marks the model with `"mmproj": true`.
+- `embedding: true` loads the model in **embedding mode** via `--embedding`, so llama-server serves real model embeddings on `POST /v1/embeddings`. Reported as `"embedding": true` in `/api/status` and `/v1/models`.
 - `POST /api/prewarm {"path": …}` loads a model **in the background**: `202 {"state":"loading"}` when a load starts, `200 {"state":"already_loaded"}` when resident, `409` when another prewarm is in flight. Chat and VibeMark stay responsive while the load runs; a concurrent VibeMark also gets `409` instead of queueing behind a benchmark.
 
 ## Android (Pocket Worker)
@@ -98,13 +114,16 @@ vibe-local cluster coordinator --addr 0.0.0.0:7900 --key <secret> --state grid-s
 vibe-local cluster agent --coordinator http://<pc-ip>:7900 --key <secret> --workers 4
 
 # Advertise specific capabilities (llm, vision, stt, tts, image_gen, video_gen,
-# embed_rag); omit for auto-detection (a local :20129 LLM probe adds "llm")
+# embed_rag); omit for auto-detection (the local :20129 probe adds "llm" for
+# any loaded model, "vision" for mmproj/vision models, "embed_rag" for
+# embedding-mode / dedicated embedding models)
 vibe-local cluster agent --coordinator http://<pc-ip>:7900 --key <secret> --capabilities llm,embed_rag
 
 # Submit workloads
 vibe-local cluster submit primes limit=10000000
 vibe-local cluster submit mandelbrot width=1920 height=1080 max_iter=1200 -o fractal.png
 vibe-local cluster submit llm_batch mode=verify --input prompts.txt   # uses Vibe Local :20129
+vibe-local cluster submit embed_batch mode=verify --input texts.txt  # embeddings; leases only to embed_rag nodes
 vibe-local cluster submit moe_distributed model_id=OLMoE-1B-7B-0924-Instruct
 # Capability-targeted jobs only lease to nodes advertising that capability
 vibe-local cluster submit llm_batch mode=verify --input prompts.txt --required-capability llm
@@ -124,7 +143,24 @@ scheduler leases a `required_capability` job only to online, unpaused nodes
 that advertise it; `GET /api/v1/capabilities` on the coordinator (proxied as
 `GET /api/grid/capabilities` on :20129) returns a directory grouped by
 capability with each node's guard state, battery/thermal readings and
-`http://<node-ip>:20129` LAN endpoint. Coordinators also answer a UDP
+`http://<node-ip>:20129` LAN endpoint.
+
+**Auto-detection:** when no `--capabilities` are given, a worker infers them
+from the models its local :20129 server reports on `/v1/models`: any loaded
+model adds `llm`; a model loaded with an mmproj projector (or a known vision
+model name — llava, moondream, *-vl, …) adds `vision`; a model loaded with
+`embedding: true` (or a known embedding model name — bge-*, *-embed*, e5-*,
+nomic-embed, …) adds `embed_rag`.
+
+**`embed_batch` workload:** batch text embedding for RAG indexing. Input is
+line-delimited texts, JSONL (`{"text": …}` / `{"prompt": …}`) or
+`---`-separated blocks — the same conventions as `llm_batch`. The preset
+stamps `required_capability: "embed_rag"` itself, so chunks only lease to
+embedding-capable nodes (an explicit `--required-capability` still wins).
+Live chunks embed through the node's `POST /v1/embeddings` in one batched
+request; `mode=verify` uses the deterministic builtin embedding. The
+assembled artifact is JSONL — one `{index, id, text, model, embedding,
+dimensions, …}` row per input, in input order. Coordinators also answer a UDP
 `VIBE_GRID_DISCOVER_V1` broadcast on port **20132** with
 `{service:"vibe-grid", coordinator_port, host, version}`, so
 `cluster discover` finds the fleet without typing IPs.
@@ -210,6 +246,10 @@ leaderboard-web/            Vanilla-JS dashboard (Pareto scatter, degradation cu
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, data flow and SQLite schema.
 
 ## Verification gates
+
+The same gates run in CI on every push and pull request to `main`
+(`.github/workflows/ci.yml`: fmt, clippy, tests and the benchmark
+self-test on Ubuntu):
 
 ```bash
 cargo fmt --all -- --check

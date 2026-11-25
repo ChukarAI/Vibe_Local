@@ -122,10 +122,7 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         return is_public_v4(v4);
     }
     // Documentation 2001:db8::/32.
-    if seg[0] == 0x2001 && seg[1] == 0x0db8 {
-        return false;
-    }
-    true
+    !(seg[0] == 0x2001 && seg[1] == 0x0db8)
 }
 
 /// Validate scheme + host allowlist, then DNS-resolve and reject any

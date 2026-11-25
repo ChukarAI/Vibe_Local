@@ -41,6 +41,20 @@ pub struct LoadRequest {
     pub draft_ngl: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_max: Option<u32>,
+    /// Multimodal projector GGUF for vision models (`--mmproj`). Validated
+    /// like the draft model: the file must exist and carry a GGUF header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmproj_path: Option<String>,
+    /// Load the model in embedding mode (`--embedding`): llama-server then
+    /// serves `POST /v1/embeddings` with real model embeddings. The builtin
+    /// fallback serves deterministic hash embeddings either way (labeled
+    /// `builtin-microeval`), so this flag is a no-op without llama-server.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub embedding: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 fn default_backend() -> String {
@@ -114,7 +128,29 @@ pub struct EngineStatus {
     pub thermal_celsius: Option<f64>,
     pub thermal_state: ThermalState,
     pub internal_port: u16,
+    /// A multimodal projector (`mmproj_path`) is loaded with the model.
+    #[serde(default)]
+    pub mmproj_loaded: bool,
+    /// The model was loaded with the `embedding` flag (`--embedding`).
+    #[serde(default)]
+    pub embedding: bool,
 }
+
+/// Result of an embeddings request: one vector per input, in input order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingReply {
+    pub vectors: Vec<Vec<f32>>,
+    pub prompt_tokens: usize,
+    pub backend: String,
+    pub engine: String,
+    /// Path of the model that produced these vectors (captured at
+    /// inference time, like `ChatReply::model`).
+    #[serde(default)]
+    pub model: String,
+}
+
+/// Maximum inputs accepted in one embeddings request.
+pub const MAX_EMBED_INPUTS: usize = 128;
 
 enum EngineCommand {
     Load(LoadRequest, SyncSender<anyhow::Result<()>>),
@@ -128,6 +164,10 @@ enum EngineCommand {
     VibeMark {
         budget_secs: u64,
         resp: SyncSender<anyhow::Result<VibeMarkResult>>,
+    },
+    Embeddings {
+        inputs: Vec<String>,
+        resp: SyncSender<anyhow::Result<EmbeddingReply>>,
     },
     Status(SyncSender<EngineStatus>),
     SetIdle(u64),
@@ -251,6 +291,24 @@ impl Engine {
                 max_tokens,
                 resp: tx,
             },
+            Duration::from_secs(300),
+        )
+    }
+
+    /// Embed a batch of texts with the loaded model. llama-server serves
+    /// real model embeddings; the builtin fallback serves deterministic
+    /// hash embeddings labeled `builtin-microeval`.
+    pub fn embeddings(&self, inputs: Vec<String>) -> anyhow::Result<EmbeddingReply> {
+        anyhow::ensure!(!inputs.is_empty(), "input must not be empty");
+        anyhow::ensure!(
+            inputs.len() <= MAX_EMBED_INPUTS,
+            "input is limited to {MAX_EMBED_INPUTS} texts per request"
+        );
+        for input in &inputs {
+            anyhow::ensure!(!input.trim().is_empty(), "input texts must not be empty");
+        }
+        self.call(
+            |tx| EngineCommand::Embeddings { inputs, resp: tx },
             Duration::from_secs(300),
         )
     }
@@ -426,6 +484,20 @@ fn worker_loop(
                     };
                     let _ = resp.send(result);
                 }
+                EngineCommand::Embeddings { inputs, resp } => {
+                    thermal.poll();
+                    let result = match loaded.as_mut() {
+                        None => Err(anyhow::anyhow!("no model loaded; POST /api/load first")),
+                        Some(_) if !thermal.allows_inference() => Err(anyhow::anyhow!(
+                            "thermal pause: device at >=45°C; inference resumes below 43°C"
+                        )),
+                        Some(model) => {
+                            model.last_activity = Instant::now();
+                            embed_with(model, &inputs, config.internal_port)
+                        }
+                    };
+                    let _ = resp.send(result);
+                }
             },
             Err(RecvTimeoutError::Timeout) => {
                 if last_thermal_poll.elapsed() >= Duration::from_secs(5) {
@@ -469,6 +541,8 @@ fn status_of(
         thermal_celsius: thermal.current_reading(),
         thermal_state: thermal.state(),
         internal_port: port,
+        mmproj_loaded: loaded.as_ref().is_some_and(|m| m.req.mmproj_path.is_some()),
+        embedding: loaded.as_ref().is_some_and(|m| m.req.embedding),
     }
 }
 
@@ -504,6 +578,11 @@ fn load_model(
         anyhow::ensure!(draft_path.is_file(), "draft model file not found: {draft}");
         vibe_local_core::gguf::parse_file(&draft_path)?;
     }
+    if let Some(mmproj) = &req.mmproj_path {
+        let mmproj_path = PathBuf::from(mmproj);
+        anyhow::ensure!(mmproj_path.is_file(), "mmproj file not found: {mmproj}");
+        vibe_local_core::gguf::parse_file(&mmproj_path)?;
+    }
     let _ = micro.ingest(&info.architecture);
 
     let Some(binary) = find_llama_server(config.llama_server_path.as_ref()) else {
@@ -535,6 +614,12 @@ fn load_model(
             .arg(req.draft_ngl.unwrap_or(0).to_string())
             .arg("--draft-max")
             .arg(req.draft_max.unwrap_or(DEFAULT_DRAFT_MAX).to_string());
+    }
+    if let Some(mmproj) = &req.mmproj_path {
+        cmd.arg("--mmproj").arg(mmproj);
+    }
+    if req.embedding {
+        cmd.arg("--embedding");
     }
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     match req.backend.as_str() {
@@ -754,6 +839,58 @@ fn probe(
     }
 }
 
+fn embed_with(model: &LoadedModel, inputs: &[String], port: u16) -> anyhow::Result<EmbeddingReply> {
+    let prompt_tokens: usize = inputs.iter().map(|t| tokenize(t).len()).sum();
+    let vectors = if model.engine == "llama-server" {
+        let url = format!("http://127.0.0.1:{port}/v1/embeddings");
+        let body = serde_json::json!({ "input": inputs });
+        let resp = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(240))
+            .build()
+            .post(&url)
+            .send_json(body)?;
+        let json: serde_json::Value = resp.into_json()?;
+        let data = json["data"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("embeddings: response has no data array"))?;
+        anyhow::ensure!(
+            data.len() == inputs.len(),
+            "embeddings: got {} vectors for {} inputs",
+            data.len(),
+            inputs.len()
+        );
+        let mut ordered: Vec<Option<Vec<f32>>> = vec![None; inputs.len()];
+        for item in data {
+            let idx = item["index"].as_u64().unwrap_or(0) as usize;
+            anyhow::ensure!(idx < inputs.len(), "embeddings: index {idx} out of range");
+            let vec: Vec<f32> = item["embedding"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("embeddings: missing embedding array"))?
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                .collect();
+            anyhow::ensure!(!vec.is_empty(), "embeddings: empty vector at index {idx}");
+            ordered[idx] = Some(vec);
+        }
+        ordered
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| anyhow::anyhow!("embeddings: missing vector in response"))?
+    } else {
+        inputs
+            .iter()
+            .map(|t| crate::microeval::deterministic_embedding(t, crate::microeval::DET_EMBED_DIM))
+            .collect()
+    };
+    Ok(EmbeddingReply {
+        vectors,
+        prompt_tokens,
+        backend: model.req.backend.clone(),
+        engine: model.engine.clone(),
+        model: model.req.path.clone(),
+    })
+}
+
 fn run_vibemark(
     model: &mut LoadedModel,
     budget_secs: u64,
@@ -831,6 +968,8 @@ mod tests {
                 draft_model_path: None,
                 draft_ngl: None,
                 draft_max: None,
+                mmproj_path: None,
+                embedding: false,
             })
             .unwrap();
         let status = engine.status().unwrap();
@@ -893,6 +1032,8 @@ mod tests {
                 draft_model_path: None,
                 draft_ngl: None,
                 draft_max: None,
+                mmproj_path: None,
+                embedding: false,
             })
             .unwrap();
         let reply = engine
@@ -942,6 +1083,8 @@ mod tests {
                 draft_model_path: None,
                 draft_ngl: None,
                 draft_max: None,
+                mmproj_path: None,
+                embedding: false,
             })
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
@@ -1010,6 +1153,8 @@ mod tests {
             draft_model_path: None,
             draft_ngl: None,
             draft_max: None,
+            mmproj_path: None,
+            embedding: false,
         }
     }
 
@@ -1055,6 +1200,22 @@ mod tests {
         .unwrap();
         assert_eq!(full.draft_max, Some(16));
         assert_eq!(full.draft_ngl, Some(99));
+        // mmproj / embedding default to absent/false when omitted.
+        assert!(req.mmproj_path.is_none());
+        assert!(!req.embedding);
+        let vision: LoadRequest = serde_json::from_str(
+            r#"{"path":"m.gguf","mmproj_path":"mmproj.gguf","embedding":true}"#,
+        )
+        .unwrap();
+        assert_eq!(vision.mmproj_path.as_deref(), Some("mmproj.gguf"));
+        assert!(vision.embedding);
+        // And they serialize back only when set.
+        let plain = serde_json::to_string(&req).unwrap();
+        assert!(!plain.contains("mmproj_path"));
+        assert!(!plain.contains("embedding"));
+        let vision_json = serde_json::to_string(&vision).unwrap();
+        assert!(vision_json.contains("\"mmproj_path\":\"mmproj.gguf\""));
+        assert!(vision_json.contains("\"embedding\":true"));
     }
 
     #[test]
@@ -1105,6 +1266,111 @@ mod tests {
             assert!(engine.status().unwrap().loaded_model.is_some());
             engine.unload();
         }
+        engine.shutdown();
+    }
+
+    fn tiny_gguf(dir: &std::path::Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&vibe_local_core::gguf::GGUF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn mmproj_validated_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = tiny_gguf(dir.path(), "tiny-Q4_K_M.gguf");
+        let engine = Engine::start(EngineConfig::default());
+        // Missing mmproj file is rejected before any spawn.
+        let err = engine
+            .load(LoadRequest {
+                path: model_path.to_string_lossy().into_owned(),
+                mmproj_path: Some(
+                    dir.path()
+                        .join("no-mmproj.gguf")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..req_for(2048, 0, "cpu")
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("mmproj file not found"), "{err}");
+        // Invalid mmproj header is rejected too.
+        let bad = dir.path().join("bad-mmproj.gguf");
+        std::fs::write(&bad, b"not a gguf").unwrap();
+        assert!(
+            engine
+                .load(LoadRequest {
+                    path: model_path.to_string_lossy().into_owned(),
+                    mmproj_path: Some(bad.to_string_lossy().into_owned()),
+                    ..req_for(2048, 0, "cpu")
+                })
+                .is_err()
+        );
+        if find_llama_server(None).is_none() {
+            // Valid mmproj + embedding flag load in builtin mode and are
+            // reported in the engine status.
+            let mmproj = tiny_gguf(dir.path(), "mmproj-F16.gguf");
+            engine
+                .load(LoadRequest {
+                    path: model_path.to_string_lossy().into_owned(),
+                    mmproj_path: Some(mmproj.to_string_lossy().into_owned()),
+                    embedding: true,
+                    ..req_for(2048, 0, "cpu")
+                })
+                .unwrap();
+            let status = engine.status().unwrap();
+            assert!(status.mmproj_loaded);
+            assert!(status.embedding);
+            engine.unload();
+            let status = engine.status().unwrap();
+            assert!(!status.mmproj_loaded);
+            assert!(!status.embedding);
+        }
+        engine.shutdown();
+    }
+
+    #[test]
+    fn embeddings_builtin_deterministic() {
+        let engine = Engine::start(EngineConfig::default());
+        // No model loaded yet.
+        assert!(engine.embeddings(vec!["hello".into()]).is_err());
+        // Boundary validation happens before the worker is touched.
+        assert!(engine.embeddings(vec![]).is_err());
+        assert!(engine.embeddings(vec!["  ".into()]).is_err());
+        assert!(
+            engine
+                .embeddings(vec!["x".to_string(); MAX_EMBED_INPUTS + 1])
+                .is_err()
+        );
+        if find_llama_server(None).is_some() {
+            engine.shutdown();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = tiny_gguf(dir.path(), "tiny-Q4_K_M.gguf");
+        engine
+            .load(LoadRequest {
+                path: model_path.to_string_lossy().into_owned(),
+                embedding: true,
+                ..req_for(2048, 0, "cpu")
+            })
+            .unwrap();
+        let reply = engine
+            .embeddings(vec!["hello world".into(), "another text".into()])
+            .unwrap();
+        assert_eq!(reply.engine, "builtin-microeval");
+        assert_eq!(reply.vectors.len(), 2);
+        assert_eq!(reply.vectors[0].len(), crate::microeval::DET_EMBED_DIM);
+        assert_ne!(reply.vectors[0], reply.vectors[1]);
+        assert!(reply.prompt_tokens > 0);
+        // Deterministic across calls.
+        let again = engine.embeddings(vec!["hello world".into()]).unwrap();
+        assert_eq!(again.vectors[0], reply.vectors[0]);
         engine.shutdown();
     }
 }

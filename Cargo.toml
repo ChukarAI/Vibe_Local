@@ -27,7 +27,7 @@ tiny_http = "0.12"
 jni = "0.21"
 getrandom = "0.2"
 libc = "0.2"
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 flate2 = "1"
 png = "0.17"
 sha2 = "0.10"

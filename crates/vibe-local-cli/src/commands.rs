@@ -79,6 +79,8 @@ pub fn bench(
         draft_model_path: None,
         draft_ngl: None,
         draft_max: None,
+        mmproj_path: None,
+        embedding: false,
     })?;
     let result = engine.vibemark(budget_secs)?;
     engine.unload();

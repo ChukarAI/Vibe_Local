@@ -46,6 +46,59 @@ pub fn tokenize(text: &str) -> Vec<String> {
     tokens
 }
 
+/// Dimension of the deterministic builtin embedding vectors.
+pub const DET_EMBED_DIM: usize = 64;
+
+/// Deterministic, L2-normalized bag-of-tokens embedding.
+///
+/// This is NOT a semantic model embedding: it is a stable hash projection
+/// (FNV-1a token hashes scattered into `dim` buckets with signed updates),
+/// used (a) as the builtin fallback for `POST /v1/embeddings` when no
+/// llama-server is present and (b) as the offline verifier for the Vibe
+/// Grid `embed_batch` workload. Identical input always yields identical
+/// output on every platform, and the result is honestly labeled
+/// `builtin-microeval` wherever it surfaces.
+pub fn deterministic_embedding(text: &str, dim: usize) -> Vec<f32> {
+    assert!(dim > 0, "embedding dimension must be positive");
+    let mut vec = vec![0f32; dim];
+    let tokens = tokenize(&text.to_lowercase());
+    if tokens.is_empty() {
+        // Hash the raw text so even punctuation-only input is non-zero.
+        scatter(&mut vec, vibe_local_core::util::fnv1a32(text.as_bytes()));
+    } else {
+        for tok in &tokens {
+            scatter(&mut vec, vibe_local_core::util::fnv1a32(tok.as_bytes()));
+        }
+    }
+    let norm = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for v in &mut vec {
+            *v /= norm;
+        }
+    }
+    vec
+}
+
+/// Scatter one token hash into a vector: four signed bucket updates driven
+/// by a splitmix64 expansion of the 32-bit hash (fully deterministic).
+fn scatter(vec: &mut [f32], hash: u32) {
+    let dim = vec.len() as u64;
+    let mut state = u64::from(hash) ^ 0x9e37_79b9_7f4a_7c15;
+    for _ in 0..4 {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        let idx = (z % dim) as usize;
+        if z & 0x8000_0000_0000_0000 != 0 {
+            vec[idx] += 1.0;
+        } else {
+            vec[idx] -= 1.0;
+        }
+    }
+}
+
 /// Evaluate an arithmetic expression with + - * / % ^ and parentheses.
 /// Returns None for anything that is not a pure arithmetic expression.
 pub fn eval_arithmetic(expr: &str) -> Option<f64> {
@@ -327,6 +380,27 @@ pub fn strip_think(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deterministic_embedding_properties() {
+        let a = deterministic_embedding("the quick brown fox", DET_EMBED_DIM);
+        let b = deterministic_embedding("the quick brown fox", DET_EMBED_DIM);
+        assert_eq!(a, b, "same input must embed identically");
+        assert_eq!(a.len(), DET_EMBED_DIM);
+        let norm: f32 = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "norm {norm}");
+        let c = deterministic_embedding("completely different words here", DET_EMBED_DIM);
+        assert_ne!(a, c);
+        // Case-insensitive and dimension-configurable.
+        assert_eq!(
+            a,
+            deterministic_embedding("THE QUICK BROWN FOX", DET_EMBED_DIM)
+        );
+        assert_eq!(deterministic_embedding("x", 8).len(), 8);
+        // Punctuation-only input still produces a usable vector.
+        let p = deterministic_embedding("!!!", DET_EMBED_DIM);
+        assert!(p.iter().any(|v| *v != 0.0));
+    }
 
     #[test]
     fn arithmetic_correct() {

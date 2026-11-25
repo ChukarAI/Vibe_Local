@@ -24,11 +24,21 @@ pub fn llm_endpoint() -> String {
     raw.strip_suffix("/v1").unwrap_or(raw).to_string()
 }
 
+/// One model reported by the local server's `/v1/models`, with the
+/// optional Vibe Local capability fields (`mmproj`, `embedding`) other
+/// OpenAI-compatible servers simply omit.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LoadedModelInfo {
+    pub id: String,
+    pub mmproj: bool,
+    pub embedding: bool,
+}
+
 struct LlmCache {
     endpoint: String,
     at: Option<Instant>,
     has: bool,
-    models: Vec<String>,
+    models: Vec<LoadedModelInfo>,
 }
 
 static LLM_CACHE: Mutex<LlmCache> = Mutex::new(LlmCache {
@@ -49,6 +59,13 @@ pub fn reset_llm_probe_cache() {
 /// Probe `<base>/v1/models` with a 300ms timeout, cached for 10s so closed
 /// localhost ports don't add latency to every agent poll.
 pub fn probe_local_llm() -> (bool, Vec<String>) {
+    let (has, models) = probe_local_models();
+    (has, models.into_iter().map(|m| m.id).collect())
+}
+
+/// Detailed variant of [`probe_local_llm`]: also carries the per-model
+/// `mmproj` / `embedding` flags used for capability auto-detection.
+pub fn probe_local_models() -> (bool, Vec<LoadedModelInfo>) {
     let ep = llm_endpoint();
     {
         let c = LLM_CACHE.lock().unwrap();
@@ -65,7 +82,7 @@ pub fn probe_local_llm() -> (bool, Vec<String>) {
     (has, models)
 }
 
-fn probe_at(base: &str) -> (bool, Vec<String>) {
+fn probe_at(base: &str) -> (bool, Vec<LoadedModelInfo>) {
     let agent = ureq::AgentBuilder::new().timeout(LLM_PROBE_TIMEOUT).build();
     let Ok(resp) = agent.get(&format!("{base}/v1/models")).call() else {
         return (false, Vec::new());
@@ -82,11 +99,69 @@ fn probe_at(base: &str) -> (bool, Vec<String>) {
             if let Some(id) = m["id"].as_str()
                 && !id.is_empty()
             {
-                models.push(id.to_string());
+                models.push(LoadedModelInfo {
+                    id: id.to_string(),
+                    mmproj: m["mmproj"].as_bool().unwrap_or(false),
+                    embedding: m["embedding"].as_bool().unwrap_or(false),
+                });
             }
         }
     }
     (true, models)
+}
+
+/// Model-name hints for vision models whose server reports no `mmproj`
+/// flag (plain llama.cpp / other OpenAI-compatible servers).
+const VISION_NAME_HINTS: [&str; 8] = [
+    "llava",
+    "moondream",
+    "pixtral",
+    "-vl-",
+    "-vl.",
+    "vision",
+    "minicpm-v",
+    "internvl",
+];
+
+/// Model-name hints for dedicated embedding models.
+const EMBED_NAME_HINTS: [&str; 9] = [
+    "embed",
+    "bge-",
+    "e5-",
+    "gte-",
+    "jina-embed",
+    "mxbai",
+    "arctic-embed",
+    "nomic-embed",
+    "embeddinggemma",
+];
+
+/// Infer heterogeneous capability labels from the models a local server
+/// reports. Pure and deterministic so it is unit-testable without a live
+/// server: `llm` for any loaded model, `vision` when a model carries an
+/// mmproj projector (or a vision name hint), `embed_rag` when a model was
+/// loaded in embedding mode (or is a known embedding model). Labels are
+/// returned in `proto::CAPABILITIES` order, deduplicated.
+pub fn infer_capabilities(has_llm: bool, models: &[LoadedModelInfo]) -> Vec<String> {
+    if !has_llm || models.is_empty() {
+        return Vec::new();
+    }
+    let mut caps = vec!["llm".to_string()];
+    let vision = models.iter().any(|m| {
+        let id = m.id.to_lowercase();
+        m.mmproj || VISION_NAME_HINTS.iter().any(|h| id.contains(h))
+    });
+    if vision {
+        caps.push("vision".to_string());
+    }
+    let embed = models.iter().any(|m| {
+        let id = m.id.to_lowercase();
+        m.embedding || EMBED_NAME_HINTS.iter().any(|h| id.contains(h))
+    });
+    if embed {
+        caps.push("embed_rag".to_string());
+    }
+    caps
 }
 
 /// Capability snapshot of the current machine. Unknown values stay -1/0.
@@ -114,13 +189,11 @@ pub fn detect() -> Caps {
     if let Some(t) = vibe_local_engine::thermal::read_celsius() {
         caps.temp_c = t;
     }
-    let (has, models) = probe_local_llm();
+    let (has, models) = probe_local_models();
     caps.has_local_llm = has;
-    caps.local_llm_models = models.clone();
-    caps.loaded_models = models;
-    if has {
-        caps.capabilities.push("llm".to_string());
-    }
+    caps.local_llm_models = models.iter().map(|m| m.id.clone()).collect();
+    caps.loaded_models = caps.local_llm_models.clone();
+    caps.capabilities = infer_capabilities(has, &models);
     caps
 }
 
@@ -513,5 +586,60 @@ mod tests {
         if has {
             assert!(models.len() <= 16);
         }
+    }
+
+    fn info(id: &str, mmproj: bool, embedding: bool) -> LoadedModelInfo {
+        LoadedModelInfo {
+            id: id.into(),
+            mmproj,
+            embedding,
+        }
+    }
+
+    #[test]
+    fn capability_inference_from_models() {
+        // No server / no models → no capabilities.
+        assert!(infer_capabilities(false, &[info("m.gguf", true, true)]).is_empty());
+        assert!(infer_capabilities(true, &[]).is_empty());
+        // Plain chat model → llm only.
+        assert_eq!(
+            infer_capabilities(true, &[info("qwen2.5-7b-Q4_K_M.gguf", false, false)]),
+            vec!["llm"]
+        );
+        // mmproj flag → vision.
+        assert_eq!(
+            infer_capabilities(true, &[info("qwen2.5-vl-7b.gguf", true, false)]),
+            vec!["llm", "vision"]
+        );
+        // Vision name hint works without the flag (foreign servers).
+        assert_eq!(
+            infer_capabilities(true, &[info("llava-v1.6-34b.gguf", false, false)]),
+            vec!["llm", "vision"]
+        );
+        // Embedding flag → embed_rag.
+        assert_eq!(
+            infer_capabilities(true, &[info("some-model.gguf", false, true)]),
+            vec!["llm", "embed_rag"]
+        );
+        // Embedding name hint works without the flag.
+        assert_eq!(
+            infer_capabilities(true, &[info("bge-large-en-v1.5-Q8_0.gguf", false, false)]),
+            vec!["llm", "embed_rag"]
+        );
+        assert_eq!(
+            infer_capabilities(true, &[info("nomic-embed-text-v1.5.gguf", false, false)]),
+            vec!["llm", "embed_rag"]
+        );
+        // Multiple models combine, in stable capability order.
+        assert_eq!(
+            infer_capabilities(
+                true,
+                &[
+                    info("bge-small.gguf", false, false),
+                    info("moondream2.gguf", false, false),
+                ]
+            ),
+            vec!["llm", "vision", "embed_rag"]
+        );
     }
 }

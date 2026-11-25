@@ -21,7 +21,8 @@ use crate::persist;
 use crate::proto::{
     HeartbeatRequest, HeartbeatResponse, JOB_CANCELLED, JOB_DONE, JOB_FAILED, JOB_QUEUED,
     JOB_RUNNING, JoinRequest, JoinResponse, PollRequest, PollResponse, ResultMsg, StateResponse,
-    SubmitJobRequest, SubmitJobResponse, TASK_LLM_BATCH, TASK_MOE_DISTRIBUTED, TASK_WORDCOUNT,
+    SubmitJobRequest, SubmitJobResponse, TASK_EMBED_BATCH, TASK_LLM_BATCH, TASK_MOE_DISTRIBUTED,
+    TASK_WORDCOUNT,
 };
 use crate::scheduler::Queue;
 use crate::workload::Registry;
@@ -240,6 +241,9 @@ pub fn start_coordinator(opts: CoordinatorOptions) -> anyhow::Result<Arc<Coordin
     let server = Server::http(bind).map_err(|e| anyhow::anyhow!("cannot bind {bind}: {e}"))?;
     let port = match server.server_addr() {
         tiny_http::ListenAddr::IP(addr) => addr.port(),
+        // The coordinator always binds an IP socket; this arm exists so
+        // the match is exhaustive on Unix (tiny_http has a Unix variant).
+        _ => 0,
     };
     let server = Arc::new(server);
     let stop = Arc::new(AtomicBool::new(false));
@@ -860,7 +864,10 @@ fn route(
             if !req.mode.is_empty() {
                 job.meta.entry("mode".into()).or_insert(req.mode.clone());
             }
-            if req.kind == TASK_WORDCOUNT || req.kind == TASK_LLM_BATCH {
+            if req.kind == TASK_WORDCOUNT
+                || req.kind == TASK_LLM_BATCH
+                || req.kind == TASK_EMBED_BATCH
+            {
                 let Some(input) = &req.input else {
                     return err_resp(
                         400,
@@ -1057,7 +1064,7 @@ fn route(
 }
 
 fn is_sensitive(kind: &str) -> bool {
-    kind == TASK_WORDCOUNT || kind == TASK_LLM_BATCH
+    kind == TASK_WORDCOUNT || kind == TASK_LLM_BATCH || kind == TASK_EMBED_BATCH
 }
 
 /// Artifact/tile auth: checked BEFORE JobExists or LRU insertion.
@@ -1082,6 +1089,7 @@ pub fn annotate_eta(st: &mut StateResponse) {
     let mut online = 0;
     let mut working = 0;
     let mut llm_ready = 0;
+    let mut embed_ready = 0;
     let mut paused_reasons: Vec<String> = Vec::new();
     for n in &st.nodes {
         if !n.online {
@@ -1094,6 +1102,9 @@ pub fn annotate_eta(st: &mut StateResponse) {
         }
         if n.caps.has_local_llm && n.paused.is_empty() {
             llm_ready += 1;
+        }
+        if n.caps.capabilities.iter().any(|c| c == "embed_rag") && n.paused.is_empty() {
+            embed_ready += 1;
         }
         if !n.paused.is_empty() && !paused_reasons.contains(&n.paused) {
             paused_reasons.push(n.paused.clone());
@@ -1121,6 +1132,15 @@ pub fn annotate_eta(st: &mut StateResponse) {
         if j.kind == TASK_LLM_BATCH && !verify && online > 0 && llm_ready == 0 && j.tasks_done == 0
         {
             j.waiting = "no online agents have Vibe Local (:20129) available".into();
+            continue;
+        }
+        if j.kind == TASK_EMBED_BATCH
+            && !verify
+            && online > 0
+            && embed_ready == 0
+            && j.tasks_done == 0
+        {
+            j.waiting = "no online agents advertise the embed_rag capability".into();
             continue;
         }
         if rate > 0.0 {
@@ -1435,6 +1455,123 @@ mod tests {
                 .starts_with("http://127.0.0.1:")
         );
         assert_eq!(dirv["capabilities"]["compute"].as_array().unwrap().len(), 1);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn embed_batch_capability_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = start_coordinator(opts(dir.path())).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port);
+        let plain_caps = json!({"cores": 4, "mem_mb": 8192, "score": 1.0, "battery_pct": -1, "on_battery": false, "temp_c": -1, "arch": "x86_64", "os": "linux", "version": "0.7.0"});
+        let mut embed_caps = plain_caps.clone();
+        embed_caps["capabilities"] = json!(["llm", "embed_rag"]);
+        embed_caps["loaded_models"] = json!(["bge-large-en-v1.5-Q8_0.gguf"]);
+        embed_caps["has_local_llm"] = json!(true);
+        let plain: serde_json::Value = post(
+            &base,
+            "/api/v1/join",
+            json!({"name": "plain", "caps": plain_caps}),
+            None,
+        )
+        .into_json()
+        .unwrap();
+        let embed: serde_json::Value = post(
+            &base,
+            "/api/v1/join",
+            json!({"name": "embedder", "caps": embed_caps}),
+            None,
+        )
+        .into_json()
+        .unwrap();
+
+        // Submit an embed_batch job in verify mode (deterministic builtin
+        // embeddings; no live runtime needed). No required_capability is
+        // sent — the preset itself stamps embed_rag.
+        use base64::Engine;
+        let input = base64::engine::general_purpose::STANDARD
+            .encode(b"alpha text\nbeta text\ngamma text\n");
+        let submit: serde_json::Value = post(
+            &base,
+            "/api/v1/jobs",
+            json!({"kind": "embed_batch", "params": {"batch_size": 2, "verify": 1}, "input": input}),
+            None,
+        )
+        .into_json()
+        .unwrap();
+        let job_id = submit["job"]["id"].as_str().unwrap().to_string();
+        assert_eq!(submit["job"]["kind"], "embed_batch");
+        assert_eq!(submit["job"]["required_capability"], "embed_rag");
+        assert_eq!(submit["job"]["tasks_total"], 2);
+
+        // The plain node is never leased an embed task.
+        let p: serde_json::Value = post(
+            &base,
+            "/api/v1/poll",
+            json!({"node_id": plain["node_id"], "name": "plain", "caps": plain_caps, "running": 0, "workers": 1}),
+            None,
+        )
+        .into_json()
+        .unwrap();
+        assert!(p["task"].is_null());
+
+        // The embed_rag node executes both chunks and reports results.
+        let preset = crate::workload::embed_batch::EmbedBatch;
+        use crate::workload::Preset;
+        for _ in 0..2 {
+            let p: serde_json::Value = post(
+                &base,
+                "/api/v1/poll",
+                json!({"node_id": embed["node_id"], "name": "embedder", "caps": embed_caps, "running": 0, "workers": 1}),
+                None,
+            )
+            .into_json()
+            .unwrap();
+            let task: crate::proto::Task = serde_json::from_value(p["task"].clone()).unwrap();
+            assert_eq!(task.kind, "embed_batch");
+            let (data, _) = preset.execute(&task).unwrap();
+            post(
+                &base,
+                "/api/v1/result",
+                json!({"task_id": task.id, "node_id": embed["node_id"], "lease_epoch": task.lease_epoch, "data": base64::engine::general_purpose::STANDARD.encode(&data), "millis": 5, "exec_millis": 5}),
+                None,
+            );
+        }
+
+        // Artifact assembles: 3 JSONL rows, in order, with full vectors.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut artifact = None;
+        while Instant::now() < deadline {
+            let resp = ureq::get(&format!("{base}/api/v1/jobs/{job_id}/artifact")).call();
+            if let Ok(r) = resp
+                && r.status() == 200
+            {
+                let mut buf = Vec::new();
+                r.into_reader().read_to_end(&mut buf).unwrap();
+                artifact = Some(buf);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let artifact = artifact.expect("embed artifact must assemble");
+        let text = String::from_utf8_lossy(&artifact);
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["index"], 0);
+        assert_eq!(rows[2]["index"], 2);
+        assert_eq!(rows[0]["text"], "alpha text");
+        assert_eq!(
+            rows[0]["dimensions"],
+            crate::workload::embed_batch::EMBED_DIM as u64
+        );
+        assert_eq!(
+            rows[0]["embedding"].as_array().unwrap().len(),
+            crate::workload::embed_batch::EMBED_DIM
+        );
+        assert_eq!(rows[0]["mode"], "verify");
         handle.shutdown();
     }
 

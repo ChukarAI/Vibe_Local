@@ -77,6 +77,9 @@ pub fn start_server(config: ServerConfig) -> anyhow::Result<Arc<ServerHandle>> {
     let server = Server::http(bind).map_err(|e| anyhow::anyhow!("cannot bind {bind}: {e}"))?;
     let actual_port = match server.server_addr() {
         tiny_http::ListenAddr::IP(addr) => addr.port(),
+        // The server always binds an IP socket; this arm exists so the
+        // match is exhaustive on Unix (tiny_http has a Unix variant).
+        _ => 0,
     };
     let server = Arc::new(server);
     let stop = Arc::new(AtomicBool::new(false));
@@ -377,6 +380,8 @@ fn route(
                 "engine": status.engine,
                 "idle_timeout_secs": status.idle_timeout_secs,
                 "thermal": {"celsius": status.thermal_celsius, "state": status.thermal_state},
+                "mmproj_loaded": status.mmproj_loaded,
+                "embedding": status.embedding,
                 "lan": state.config.lan,
                 "port": state.config.port,
             })))
@@ -500,6 +505,7 @@ fn route(
                 data.push(json!({
                     "id": id, "object": "model", "created": util::unix_now(),
                     "owned_by": "vibe-local", "backend": status.backend, "engine": status.engine,
+                    "mmproj": status.mmproj_loaded, "embedding": status.embedding,
                 }));
             }
             Ok(ok_json(json!({"object": "list", "data": data})))
@@ -570,6 +576,73 @@ fn route(
                         "X-Vibe-Local-Tok-Per-Sec",
                         format!("{:.2}", reply.tok_per_sec),
                     ),
+                    ("X-Vibe-Local-Backend", reply.backend.clone()),
+                    ("X-Vibe-Local-Engine", reply.engine.clone()),
+                ],
+            ))
+        }
+        (Method::Post, "/v1/embeddings") => {
+            let body = read_body(request)?;
+            let value: serde_json::Value = serde_json::from_str(&body)?;
+            // OpenAI shape: `input` is a string or an array of strings.
+            let inputs: Vec<String> = match &value["input"] {
+                serde_json::Value::String(s) => vec![s.clone()],
+                serde_json::Value::Array(arr) => {
+                    let mut out = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        let Some(s) = item.as_str() else {
+                            return Ok(err_json(400, "input array must contain only strings"));
+                        };
+                        out.push(s.to_string());
+                    }
+                    out
+                }
+                _ => return Ok(err_json(400, "input (string or array of strings) required")),
+            };
+            if inputs.is_empty() || inputs.iter().any(|s| s.trim().is_empty()) {
+                return Ok(err_json(
+                    400,
+                    "input must contain at least one non-empty text",
+                ));
+            }
+            if inputs.len() > vibe_local_engine::MAX_EMBED_INPUTS {
+                return Ok(err_json(
+                    400,
+                    &format!(
+                        "input is limited to {} texts per request",
+                        vibe_local_engine::MAX_EMBED_INPUTS
+                    ),
+                ));
+            }
+            let reply = state.config.engine.embeddings(inputs)?;
+            let model_id = if reply.model.is_empty() {
+                "vibe-local".to_string()
+            } else {
+                std::path::Path::new(&reply.model)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| reply.model.clone())
+            };
+            let data: Vec<serde_json::Value> = reply
+                .vectors
+                .iter()
+                .enumerate()
+                .map(|(i, v)| json!({"object": "embedding", "index": i, "embedding": v}))
+                .collect();
+            let resp = json!({
+                "object": "list",
+                "data": data,
+                "model": model_id,
+                "usage": {
+                    "prompt_tokens": reply.prompt_tokens,
+                    "total_tokens": reply.prompt_tokens,
+                },
+            });
+            Ok(json_response(
+                200,
+                resp,
+                &[
+                    ("X-Vibe-Router-Cost-Micros", "0".to_string()),
                     ("X-Vibe-Local-Backend", reply.backend.clone()),
                     ("X-Vibe-Local-Engine", reply.engine.clone()),
                 ],
@@ -708,6 +781,8 @@ fn vibemark_route(request: &mut Request, state: &AppState) -> HttpResult {
                 draft_model_path: value["draft_model_path"].as_str().map(String::from),
                 draft_ngl: value["draft_ngl"].as_i64().map(|v| v as i32),
                 draft_max: value["draft_max"].as_u64().map(|v| v as u32),
+                mmproj_path: value["mmproj_path"].as_str().map(String::from),
+                embedding: value["embedding"].as_bool().unwrap_or(false),
             })?;
         }
     }
@@ -765,6 +840,8 @@ fn prewarm_route(request: &mut Request, state: &AppState) -> HttpResult {
         draft_model_path: value["draft_model_path"].as_str().map(String::from),
         draft_ngl: value["draft_ngl"].as_i64().map(|v| v as i32),
         draft_max: value["draft_max"].as_u64().map(|v| v as u32),
+        mmproj_path: value["mmproj_path"].as_str().map(String::from),
+        embedding: value["embedding"].as_bool().unwrap_or(false),
     };
     let engine = Arc::clone(&state.config.engine);
     let flag = Arc::clone(&state.prewarm_running);
@@ -1416,6 +1493,129 @@ mod tests {
 
         let models: serde_json::Value = get(&format!("{base}/v1/models")).into_json().unwrap();
         assert_eq!(models["data"].as_array().unwrap().len(), 1);
+        handle.shutdown();
+    }
+
+    fn load_tiny_model(base: &str, token: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("tiny-Q4_K_M.gguf");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&vibe_local_core::gguf::GGUF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&model_path, bytes).unwrap();
+        let mut req = ureq::post(&format!("{base}/api/load"));
+        if let Some(t) = token {
+            req = req.set("X-Vibe-Local-Token", t);
+        }
+        req.send_json(
+            json!({"path": model_path.to_string_lossy(), "backend": "cpu", "embedding": true}),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn embeddings_route_single_and_array() {
+        let (handle, base) = test_state(false, None);
+        if vibe_local_engine::supervisor::find_llama_server(None).is_some() {
+            handle.shutdown();
+            return; // real llama-server present; builtin path not exercised
+        }
+        let _dir = load_tiny_model(&base, None);
+
+        // Single string input.
+        let resp = ureq::post(&format!("{base}/v1/embeddings"))
+            .send_json(json!({"input": "hello world"}))
+            .unwrap();
+        assert_eq!(resp.header("X-Vibe-Router-Cost-Micros"), Some("0"));
+        assert_eq!(
+            resp.header("X-Vibe-Local-Engine"),
+            Some("builtin-microeval")
+        );
+        let body: serde_json::Value = resp.into_json().unwrap();
+        assert_eq!(body["object"], "list");
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["index"], 0);
+        let vec0 = data[0]["embedding"].as_array().unwrap();
+        assert_eq!(vec0.len(), vibe_local_engine::microeval::DET_EMBED_DIM);
+        assert!(body["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+
+        // Array input: two vectors, indices in order, first one identical
+        // to the single-string call (deterministic builtin).
+        let resp = ureq::post(&format!("{base}/v1/embeddings"))
+            .send_json(json!({"input": ["hello world", "another text"]}))
+            .unwrap();
+        let body: serde_json::Value = resp.into_json().unwrap();
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["index"], 0);
+        assert_eq!(data[1]["index"], 1);
+        assert_eq!(data[0]["embedding"], serde_json::json!(vec0));
+        assert_ne!(data[0]["embedding"], data[1]["embedding"]);
+
+        // Bad inputs are 400, not 500.
+        for bad in [
+            json!({}),
+            json!({"input": []}),
+            json!({"input": "   "}),
+            json!({"input": [42]}),
+            json!({"input": ["ok", ""]}),
+        ] {
+            let err = ureq::post(&format!("{base}/v1/embeddings"))
+                .send_json(bad)
+                .unwrap_err();
+            assert!(matches!(err, ureq::Error::Status(400, _)), "{err:?}");
+        }
+
+        // /v1/models advertises the embedding flag for capability detection.
+        let models: serde_json::Value = get(&format!("{base}/v1/models")).into_json().unwrap();
+        assert_eq!(models["data"][0]["embedding"], true);
+        assert_eq!(models["data"][0]["mmproj"], false);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn embeddings_lan_guards() {
+        let (handle, base) = test_state(true, Some("secret-token-123"));
+        if vibe_local_engine::supervisor::find_llama_server(None).is_some() {
+            handle.shutdown();
+            return;
+        }
+        // LAN auth: no token → 401, wrong token → 401.
+        let err = ureq::post(&format!("{base}/v1/embeddings"))
+            .send_json(json!({"input": "hello"}))
+            .unwrap_err();
+        assert!(matches!(err, ureq::Error::Status(401, _)));
+        let err = ureq::post(&format!("{base}/v1/embeddings"))
+            .set("X-Vibe-Local-Token", "wrong")
+            .send_json(json!({"input": "hello"}))
+            .unwrap_err();
+        assert!(matches!(err, ureq::Error::Status(401, _)));
+        // Host guard: foreign Host → 421 even with a valid token.
+        let err = ureq::post(&format!("{base}/v1/embeddings"))
+            .set("X-Vibe-Local-Token", "secret-token-123")
+            .set("Host", "evil.com")
+            .send_json(json!({"input": "hello"}))
+            .unwrap_err();
+        assert!(matches!(err, ureq::Error::Status(421, _)));
+        // Body limit: oversized Content-Length → 413.
+        let err = ureq::post(&format!("{base}/v1/embeddings"))
+            .set("X-Vibe-Local-Token", "secret-token-123")
+            .set("Content-Type", "application/json")
+            .send_bytes(&vec![b' '; MAX_BODY_BYTES as usize + 1])
+            .unwrap_err();
+        assert!(matches!(err, ureq::Error::Status(413, _)));
+        // Valid token + valid Host + small body → 200 with the cost header.
+        let _dir = load_tiny_model(&base, Some("secret-token-123"));
+        let resp = ureq::post(&format!("{base}/v1/embeddings"))
+            .set("X-Vibe-Local-Token", "secret-token-123")
+            .send_json(json!({"input": "hello"}))
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.header("X-Vibe-Router-Cost-Micros"), Some("0"));
         handle.shutdown();
     }
 

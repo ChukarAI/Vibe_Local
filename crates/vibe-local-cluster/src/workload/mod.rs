@@ -1,6 +1,7 @@
 //! Pluggable workload presets: validate → split → execute → aggregate.
 //! Adding a workload never touches the scheduler or server.
 
+pub mod embed_batch;
 pub mod llm_batch;
 pub mod mandelbrot;
 pub mod moe;
@@ -52,13 +53,15 @@ impl Registry {
         }
     }
 
-    /// The full Vibe Grid registry: four compost classics + distributed MoE.
+    /// The full Vibe Grid registry: four compost classics + distributed MoE
+    /// + heterogeneous capability workloads (`embed_batch`).
     pub fn with_defaults() -> Registry {
         let mut r = Registry::new();
         r.register(Box::new(mandelbrot::Mandelbrot));
         r.register(Box::new(primes::Primes));
         r.register(Box::new(wordcount::Wordcount));
         r.register(Box::new(llm_batch::LlmBatch));
+        r.register(Box::new(embed_batch::EmbedBatch));
         r.register(Box::new(moe::MoeDistributed));
         r
     }
@@ -113,6 +116,7 @@ mod tests {
         assert_eq!(
             r.names(),
             vec![
+                "embed_batch",
                 "llm_batch",
                 "mandelbrot",
                 "moe_distributed",
@@ -122,6 +126,6 @@ mod tests {
         );
         assert!(r.get("primes").is_some());
         assert!(r.get("nope").is_none());
-        assert_eq!(r.info().len(), 5);
+        assert_eq!(r.info().len(), 6);
     }
 }

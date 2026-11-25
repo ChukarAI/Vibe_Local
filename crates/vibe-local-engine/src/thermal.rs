@@ -5,10 +5,12 @@
 //! [`ThermalGovernor::set_override`].
 
 use std::sync::atomic::{AtomicI64, Ordering};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use vibe_local_core::util::run_with_timeout;
 
 pub const THROTTLE_C: f64 = 42.0;
