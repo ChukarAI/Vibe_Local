@@ -118,7 +118,7 @@ settings(key, value)
 - `Load`: validates the GGUF header, then spawns `llama-server -m … --host 127.0.0.1 --port 20130 -ngl N -c CTX -np 1` with backend env (`CUDA_VISIBLE_DEVICES` / `GGML_VK_DEVICE`), polls `/health` up to 150s, kills the child on failure. Binary resolution: explicit > `VIBE_LLAMA_SERVER` > `PATH` > `./llama.cpp/build/bin`.
 - **Auto-context**: `LoadRequest.ctx == 0` picks the largest GGUF-estimated window (2k/4k/8k/16k, capped at the trained `context_length`) whose RAM estimate fits live free VRAM (when offloading) or free RAM, minus `CTX_SAFETY_MARGIN_MB = 512`. Nothing fits → smallest estimated window (or 2048), never invented capacity.
 - **Speculative decoding**: `LoadRequest.draft_model_path` (+ `draft_ngl`, `draft_max` default 8) adds `--model-draft` / `--gpu-layers-draft` / `--draft-max`; the draft GGUF header is validated like the main model.
-- **Vision + embedding loads**: `LoadRequest.mmproj_path` adds `--mmproj` (validated like the draft model: must exist, valid GGUF header) and `LoadRequest.embedding: bool` adds `--embedding`. Both surface in `EngineStatus` (`mmproj_loaded`, `embedding`), `GET /api/status`, and `GET /v1/models` (`"mmproj"` / `"embedding"` per model) — the flags the cluster capability probe consumes (§16.3).
+- **Vision + embedding loads**: `LoadRequest.mmproj_path` adds `--mmproj` (validated like the draft model: must exist, valid GGUF header) and `LoadRequest.embedding: bool` adds `--embedding`. Both surface in `EngineStatus` as `has_vision` / `has_embeddings`, in `GET /api/status` under the same names, and in `GET /v1/models` (`"mmproj"` / `"embedding"` per model) — the flags the cluster capability probe consumes (§16.3).
 - **Embeddings**: `Engine::embeddings(Vec<String>)` (≤128 inputs, non-empty) runs through the same command channel and thermal gate as chat. llama-server mode proxies `/v1/embeddings` and re-orders vectors by their `index`; builtin mode returns `microeval::deterministic_embedding` vectors, labeled `builtin-microeval`.
 - **No binary → builtin micro-eval mode** (real deterministic engine, never a stub, always labeled).
 - **Idle auto-unload**: `recv_timeout(1s)` loop tracks `last_activity`; after `idle_secs` (default 300) the child is killed and state cleared.
@@ -240,7 +240,7 @@ semantics, v3 defaults) rather than Go gob.
 | `server` | Coordinator: tiny_http workers, gzip body decoding under a **9MiB cap (413)**, 8MiB job-input cap, 8 concurrent jobs, artifact assembly threads + **8-entry LRU** + disk offload, auth-before-cache (no LRU thrashing), state redaction, ETA/Waiting annotation, `/healthz`, Prometheus `/metrics` (compost metric names), 10s persistence loop, embedded CSP-safe dashboard |
 | `agent` | Outward-only worker: join w/ full-jitter backoff, poll batches, worker pool (1–16), `ExecMillis` strictly around execute, inflight epoch tracking + 5s heartbeats, async upload loop (gzip >4KiB), battery/thermal pause reasons, flush on stop |
 | `node` | Caps via core HardwareProbe + battery (Win `GetSystemPowerStatus`, Linux/Android sysfs, macOS pmset) + engine thermal; xorshift64 benchmark (identical kernel cross-arch); `.vibe-node-id` persistent UUIDv4 with SHA-256 hardware fingerprint fallback (hostname/os/arch/cores/MACs); `:20129` LLM probe (300ms, 10s cache) |
-| `workload` | Preset SPI + `mandelbrot` (exact tile geometry/palette, PNG, ≤0.05% edge-pixel replica tolerance), `primes` (6k±1, π-verified), `wordcount` (word-aligned map/reduce), `llm_batch` (JSONL/MD/lines, verify mode, live `:20129`), `embed_batch` (same input conventions; stamps `required_capability: "embed_rag"`; live chunks = one batched `:20129/v1/embeddings` request; artifact = ordered JSONL with dimension-consistency check), `moe_distributed` |
+| `workload` | Preset SPI + `mandelbrot` (exact tile geometry/palette, PNG, ≤0.05% edge-pixel replica tolerance), `primes` (6k±1, π-verified), `wordcount` (word-aligned map/reduce), `llm_batch` (JSONL/MD/lines, verify mode, live `:20129`), `embed_batch` (same input conventions; stamps `required_capability: "embed_rag"`; live chunks = one batched `:20129/v1/embeddings` request; artifact = ordered JSON array of `{index, text_hash, embedding, engine}` with dimension-consistency check), `moe_distributed` |
 | `persist` | Gzipped JSON snapshots v4 (v3-compatible defaults) |
 | `moe_grid` | Distributed MoE planner + fault-tolerant shard router (below) |
 | `grid_discovery` | UDP `VIBE_GRID_DISCOVER_V1` responder (port 20132) + broadcast `discover()` (Wave 3, §16) |
@@ -375,9 +375,11 @@ benchmark), so overlapping prewarms reliably get `409`; responses are
 - Auto-detection: a successful local `:20129` LLM probe advertises `llm`
   and the probed model list; `agent --capabilities a,b` overrides with
   validated, deduplicated labels. Wave 4 extends the probe
-  (`node::infer_capabilities`, pure + unit-tested): the `/v1/models`
-  entries' `mmproj` / `embedding` flags — or vision / embedding model-name
-  hints for servers that omit them — add `vision` / `embed_rag` (§18).
+  (`node::infer_capabilities`, pure + unit-tested): the probe also reads
+  `GET /api/status` — `has_vision` / `has_embeddings` are authoritative —
+  and the `/v1/models` entries' `mmproj` / `embedding` flags, or vision /
+  embedding model-name hints for servers that omit them, add `vision` /
+  `embed_rag` (§18).
 - `Job` / `SubmitJobRequest` gain `required_capability` (validated against
   the label set at submit, `400` on unknown). `lease_batch` skips nodes
   that don't advertise the required capability — capability-targeted work
@@ -435,18 +437,20 @@ SO_REUSEADDR coexistence), jni 5
   hash embedding (§3.2). LAN auth, the 8 MiB body cap (413) and the Host
   guard (421) apply unchanged because the route sits behind the same
   middleware; the response carries `X-Vibe-Router-Cost-Micros: 0`.
-- **Capability auto-detection** (`node.rs`): the `:20129` probe now parses
+- **Capability auto-detection** (`node.rs`): the `:20129` probe reads
+  `GET /api/status` (`has_vision` / `has_embeddings`, authoritative) and
   per-model `mmproj` / `embedding` flags from `/v1/models`;
-  `infer_capabilities` maps loaded models to `llm` / `vision` /
-  `embed_rag` with name-hint fallbacks (llava, moondream, *-vl* for
-  vision; embed, bge-, e5-, gte-, nomic-embed, … for embeddings).
+  `infer_capabilities` maps the probe to `llm` / `vision` / `embed_rag`
+  with name-hint fallbacks (llava, moondream, *-vl* for vision; embed,
+  bge-, e5-, gte-, nomic-embed, … for embeddings).
 - **`embed_batch` preset** (`workload/embed_batch.rs`): capability-filtered
   batch embedding for RAG indexing. `validate` stamps
   `required_capability: "embed_rag"` (submit may override), `split`
   chunks by `batch_size` (1–64, default 8), live `execute` sends one
   batched embeddings request per chunk, verify `execute` uses the
-  deterministic builtin embedding, and `aggregate` assembles ordered
-  JSONL after checking index contiguity and dimension consistency.
+  deterministic builtin embedding, and `aggregate` assembles a JSON
+  array of `{index, text_hash, embedding, engine}` rows after checking
+  index contiguity and dimension consistency.
   Job input is required at submit like `llm_batch`, and the kind is
   treated as sensitive for artifact auth. The coordinator's Waiting
   annotation reports when no online agent advertises `embed_rag`.
@@ -455,9 +459,10 @@ SO_REUSEADDR coexistence), jni 5
   `socket2` enables the `all` feature so `set_reuse_port` exists on
   Unix, and `thermal.rs` gates its Windows/macOS-only imports — the
   workspace now builds and lints clean on Linux, which is what CI runs.
-- **CI**: `.github/workflows/ci.yml` runs the four verification gates
-  (fmt, clippy `-D warnings`, workspace tests, benchmark self-test) on
-  Ubuntu for every push / pull request to `main`.
+- **CI**: `.github/workflows/ci.yml` runs the four verification gates on
+  Ubuntu for every push / pull request to `main`, in two jobs —
+  `rust-gates` (fmt, clippy `-D warnings`, workspace tests) and
+  `python-bench-selftest` — with `permissions: contents: read`.
 
 ## 19. Wave 4 verification
 
@@ -469,7 +474,7 @@ including new coverage for mmproj validation + the embedding flag
 inference (mmproj flag, embedding flag, name hints, combined models),
 and the end-to-end `embed_batch` pipeline (submission with preset-stamped
 `required_capability`, no lease to a capability-less node, execution on
-the `embed_rag` node, JSONL artifact assembly). Gates: `cargo fmt --all
+the `embed_rag` node, JSON artifact assembly). Gates: `cargo fmt --all
 -- --check` ✔, `cargo clippy --workspace --all-targets -- -D warnings`
 ✔, `cargo test --workspace` ✔ (187/190 in the Linux sandbox where this
 wave was developed — the 3 remaining tests are the pre-existing UDP

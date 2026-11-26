@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::node;
 use crate::proto::{JOB_QUEUED, Job, TASK_EMBED_BATCH, Task};
@@ -48,14 +49,29 @@ pub struct EmbedResultItem {
     pub index: usize,
     pub id: String,
     pub text: String,
+    /// SHA-256 (hex) of `text` — the artifact identifies each row by
+    /// this hash, so consumers can join vectors back to their corpus
+    /// without the artifact duplicating the text itself.
+    #[serde(default)]
+    pub text_hash: String,
     pub model: String,
     /// The embedding vector, rounded to 6 decimals so artifacts are
     /// byte-stable across replicas and platforms.
     pub embedding: Vec<f32>,
+    /// Engine that produced the vector: `builtin-microeval` in verify
+    /// mode, otherwise the engine reported by the embeddings endpoint
+    /// (`llama-server` when it does not label itself).
+    #[serde(default)]
+    pub engine: String,
     pub dimensions: usize,
     pub latency_ms: i64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mode: String,
+}
+
+/// SHA-256 hex digest of a text — see `EmbedResultItem::text_hash`.
+fn text_hash(text: &str) -> String {
+    vibe_local_core::util::hex_encode(&Sha256::digest(text.as_bytes()))
 }
 
 /// Accept JSONL objects (`{"text": ...}` or `{"prompt": ...}`),
@@ -164,10 +180,12 @@ fn execute_item(
         return Ok(EmbedResultItem {
             index: idx,
             id: item.id.clone(),
+            text_hash: text_hash(&item.text),
             text: item.text.clone(),
             model,
             dimensions: vec.len(),
             embedding: round_vec(&vec),
+            engine: "builtin-microeval".into(),
             latency_ms: 1,
             mode: "verify".into(),
         });
@@ -221,6 +239,10 @@ fn execute_live(base: usize, env: &EmbedTaskEnvelope) -> anyhow::Result<Vec<Embe
         by_index[i] = Some(vec);
     }
     let model = parsed["model"].as_str().unwrap_or(&env.model).to_string();
+    let engine = parsed["engine"]
+        .as_str()
+        .unwrap_or("llama-server")
+        .to_string();
     let mut out = Vec::with_capacity(env.items.len());
     for (pos, item) in env.items.iter().enumerate() {
         let vec = by_index[pos]
@@ -229,10 +251,12 @@ fn execute_live(base: usize, env: &EmbedTaskEnvelope) -> anyhow::Result<Vec<Embe
         out.push(EmbedResultItem {
             index: base + pos,
             id: item.id.clone(),
+            text_hash: text_hash(&item.text),
             text: item.text.clone(),
             model: model.clone(),
             dimensions: vec.len(),
             embedding: round_vec(&vec),
+            engine: engine.clone(),
             latency_ms,
             mode: "live".into(),
         });
@@ -245,7 +269,7 @@ impl Preset for EmbedBatch {
         TASK_EMBED_BATCH
     }
     fn describe(&self) -> &'static str {
-        "batch text embedding via embed_rag nodes (Vibe Local :20129) → JSONL"
+        "batch text embedding via embed_rag nodes (Vibe Local :20129) → JSON array"
     }
 
     fn validate(&self, params: &BTreeMap<String, f64>) -> anyhow::Result<Job> {
@@ -396,12 +420,21 @@ impl Preset for EmbedBatch {
             );
         }
         let _ = job;
-        let mut out = Vec::new();
-        for item in &all {
-            out.extend_from_slice(&serde_json::to_vec(item)?);
-            out.push(b'\n');
-        }
-        Ok((out, "text/plain; charset=utf-8".into(), ".jsonl".into()))
+        // The artifact is a single JSON array of the contract rows:
+        // {index, text_hash, embedding, engine} per input, in order.
+        let rows: Vec<serde_json::Value> = all
+            .iter()
+            .map(|i| {
+                serde_json::json!({
+                    "index": i.index,
+                    "text_hash": i.text_hash,
+                    "embedding": i.embedding,
+                    "engine": i.engine,
+                })
+            })
+            .collect();
+        let out = serde_json::to_vec(&rows)?;
+        Ok((out, "application/json".into(), ".json".into()))
     }
 
     fn result_size(&self, _t: &Task) -> usize {
@@ -473,22 +506,30 @@ mod tests {
             results.insert(t.id.clone(), data);
         }
         let (artifact, ct, ext) = EmbedBatch.aggregate(&job, &order, &results).unwrap();
-        assert_eq!(ext, ".jsonl");
-        assert!(ct.starts_with("text/plain"));
-        let text = String::from_utf8_lossy(&artifact);
-        assert_eq!(text.lines().count(), 3);
-        let first: EmbedResultItem = serde_json::from_str(text.lines().next().unwrap()).unwrap();
-        assert_eq!(first.dimensions, EMBED_DIM);
-        assert_eq!(first.embedding.len(), EMBED_DIM);
-        assert_eq!(first.mode, "verify");
-        let norm: f32 = first.embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert_eq!(ext, ".json");
+        assert_eq!(ct, "application/json");
+        // The artifact is one JSON array of {index, text_hash,
+        // embedding, engine} rows in input order.
+        let rows: serde_json::Value = serde_json::from_slice(&artifact).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        let first = &rows[0];
+        assert_eq!(first["index"], 0);
+        assert_eq!(first["text_hash"], text_hash("alpha text"));
+        assert_eq!(first["engine"], "builtin-microeval");
+        let vec0: Vec<f32> = serde_json::from_value(first["embedding"].clone()).unwrap();
+        assert_eq!(vec0.len(), EMBED_DIM);
+        let norm: f32 = vec0.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 0.01, "norm {norm}");
+        assert_eq!(rows[1]["index"], 1);
+        assert_eq!(rows[2]["index"], 2);
+        assert_eq!(rows[2]["text_hash"], text_hash("gamma text"));
         // Deterministic: identical re-execution, byte for byte.
         let (a, _) = EmbedBatch.execute(&tasks[0]).unwrap();
         let (b, _) = EmbedBatch.execute(&tasks[0]).unwrap();
         assert_eq!(a, b);
         // Different texts embed differently.
-        let third: EmbedResultItem = serde_json::from_str(text.lines().nth(2).unwrap()).unwrap();
-        assert_ne!(first.embedding, third.embedding);
+        assert_ne!(rows[0]["embedding"], rows[2]["embedding"]);
+        assert_ne!(rows[0]["text_hash"], rows[2]["text_hash"]);
     }
 }

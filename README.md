@@ -74,7 +74,8 @@ curl http://127.0.0.1:20129/v1/embeddings \
   -H 'Content-Type: application/json' \
   -d '{"input":["first text","second text"]}'
 # → {"object":"list","data":[{"object":"embedding","index":0,"embedding":[…]},…],
-#    "model":"…","usage":{"prompt_tokens":…,"total_tokens":…}}
+#    "model":"…","engine":"llama-server" | "builtin-microeval",
+#    "usage":{"prompt_tokens":…,"total_tokens":…}}
 ```
 
 `input` accepts a single string or an array of strings (max 128). With llama-server the vectors are the loaded model's real embeddings (load with `"embedding": true`, see below); without it the builtin fallback serves deterministic, L2-normalized hash embeddings honestly labeled `builtin-microeval` — stable across calls and platforms, but **not** semantic model embeddings.
@@ -85,8 +86,8 @@ curl http://127.0.0.1:20129/v1/embeddings \
 
 - `ctx: 0` (or omitted) **auto-sizes the context window**: the largest GGUF-estimated window (2k/4k/8k/16k, capped at the model's trained length) whose RAM estimate fits live free VRAM (GPU offload) or free RAM (CPU), minus a 512MB safety margin.
 - `draft_model_path` (+ optional `draft_ngl`, `draft_max`, default 8) enables **native llama.cpp speculative decoding** via `--model-draft` / `--gpu-layers-draft` / `--draft-max`.
-- `mmproj_path` loads a **multimodal projector** GGUF via `--mmproj` for vision models. It is validated exactly like the draft model: the file must exist and carry a valid GGUF header, or the load is rejected before anything spawns. `GET /api/status` reports `mmproj_loaded`, and `GET /v1/models` marks the model with `"mmproj": true`.
-- `embedding: true` loads the model in **embedding mode** via `--embedding`, so llama-server serves real model embeddings on `POST /v1/embeddings`. Reported as `"embedding": true` in `/api/status` and `/v1/models`.
+- `mmproj_path` loads a **multimodal projector** GGUF via `--mmproj` for vision models. It is validated exactly like the draft model: the file must exist and carry a valid GGUF header, or the load is rejected before anything spawns. `GET /api/status` reports `has_vision: true`, and `GET /v1/models` marks the model with `"mmproj": true`.
+- `embedding: true` loads the model in **embedding mode** via `--embedding`, so llama-server serves real model embeddings on `POST /v1/embeddings`. Reported as `has_embeddings: true` in `/api/status` and `"embedding": true` in `/v1/models`.
 - `POST /api/prewarm {"path": …}` loads a model **in the background**: `202 {"state":"loading"}` when a load starts, `200 {"state":"already_loaded"}` when resident, `409` when another prewarm is in flight. Chat and VibeMark stay responsive while the load runs; a concurrent VibeMark also gets `409` instead of queueing behind a benchmark.
 
 ## Android (Pocket Worker)
@@ -147,10 +148,12 @@ capability with each node's guard state, battery/thermal readings and
 
 **Auto-detection:** when no `--capabilities` are given, a worker infers them
 from the models its local :20129 server reports on `/v1/models`: any loaded
-model adds `llm`; a model loaded with an mmproj projector (or a known vision
-model name — llava, moondream, *-vl, …) adds `vision`; a model loaded with
-`embedding: true` (or a known embedding model name — bge-*, *-embed*, e5-*,
-nomic-embed, …) adds `embed_rag`.
+model adds `llm`; a node whose `/api/status` reports `has_vision` (or a
+model loaded with an mmproj projector, or a known vision model name —
+llava, moondream, *-vl, …) adds `vision`; a node reporting
+`has_embeddings` (or a model loaded with `embedding: true`, or a known
+embedding model name — bge-*, *-embed*, e5-*, nomic-embed, …) adds
+`embed_rag`.
 
 **`embed_batch` workload:** batch text embedding for RAG indexing. Input is
 line-delimited texts, JSONL (`{"text": …}` / `{"prompt": …}`) or
@@ -159,8 +162,10 @@ stamps `required_capability: "embed_rag"` itself, so chunks only lease to
 embedding-capable nodes (an explicit `--required-capability` still wins).
 Live chunks embed through the node's `POST /v1/embeddings` in one batched
 request; `mode=verify` uses the deterministic builtin embedding. The
-assembled artifact is JSONL — one `{index, id, text, model, embedding,
-dimensions, …}` row per input, in input order. Coordinators also answer a UDP
+assembled artifact is a JSON array — one `{index, text_hash, embedding,
+engine}` row per input, in input order (`text_hash` = SHA-256 hex of the
+source text, `engine` = the engine that produced the vector).
+Coordinators also answer a UDP
 `VIBE_GRID_DISCOVER_V1` broadcast on port **20132** with
 `{service:"vibe-grid", coordinator_port, host, version}`, so
 `cluster discover` finds the fleet without typing IPs.
@@ -248,8 +253,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, data flow and SQLite
 ## Verification gates
 
 The same gates run in CI on every push and pull request to `main`
-(`.github/workflows/ci.yml`: fmt, clippy, tests and the benchmark
-self-test on Ubuntu):
+(`.github/workflows/ci.yml`, jobs `rust-gates` and
+`python-bench-selftest` on Ubuntu, `contents: read` only):
 
 ```bash
 cargo fmt --all -- --check

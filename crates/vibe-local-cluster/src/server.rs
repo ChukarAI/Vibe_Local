@@ -1538,7 +1538,7 @@ mod tests {
             );
         }
 
-        // Artifact assembles: 3 JSONL rows, in order, with full vectors.
+        // Artifact assembles: JSON array, 3 rows in order, full vectors.
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut artifact = None;
         while Instant::now() < deadline {
@@ -1554,24 +1554,23 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         let artifact = artifact.expect("embed artifact must assemble");
-        let text = String::from_utf8_lossy(&artifact);
-        let rows: Vec<serde_json::Value> = text
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
+        // Artifact is a JSON array of {index, text_hash, embedding,
+        // engine} rows in input order.
+        let rows: serde_json::Value = serde_json::from_slice(&artifact).unwrap();
+        let rows = rows.as_array().unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["index"], 0);
         assert_eq!(rows[2]["index"], 2);
-        assert_eq!(rows[0]["text"], "alpha text");
-        assert_eq!(
-            rows[0]["dimensions"],
-            crate::workload::embed_batch::EMBED_DIM as u64
-        );
+        {
+            use sha2::Digest;
+            let expect = vibe_local_core::util::hex_encode(&sha2::Sha256::digest(b"alpha text"));
+            assert_eq!(rows[0]["text_hash"], expect);
+        }
+        assert_eq!(rows[0]["engine"], "builtin-microeval");
         assert_eq!(
             rows[0]["embedding"].as_array().unwrap().len(),
             crate::workload::embed_batch::EMBED_DIM
         );
-        assert_eq!(rows[0]["mode"], "verify");
         handle.shutdown();
     }
 

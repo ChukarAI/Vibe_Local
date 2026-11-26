@@ -39,6 +39,9 @@ struct LlmCache {
     at: Option<Instant>,
     has: bool,
     models: Vec<LoadedModelInfo>,
+    /// `has_vision` / `has_embeddings` from the server's `/api/status`.
+    has_vision: bool,
+    has_embeddings: bool,
 }
 
 static LLM_CACHE: Mutex<LlmCache> = Mutex::new(LlmCache {
@@ -46,6 +49,8 @@ static LLM_CACHE: Mutex<LlmCache> = Mutex::new(LlmCache {
     at: None,
     has: false,
     models: Vec::new(),
+    has_vision: false,
+    has_embeddings: false,
 });
 
 pub fn reset_llm_probe_cache() {
@@ -54,6 +59,8 @@ pub fn reset_llm_probe_cache() {
     c.endpoint.clear();
     c.has = false;
     c.models.clear();
+    c.has_vision = false;
+    c.has_embeddings = false;
 }
 
 /// Probe `<base>/v1/models` with a 300ms timeout, cached for 10s so closed
@@ -66,35 +73,50 @@ pub fn probe_local_llm() -> (bool, Vec<String>) {
 /// Detailed variant of [`probe_local_llm`]: also carries the per-model
 /// `mmproj` / `embedding` flags used for capability auto-detection.
 pub fn probe_local_models() -> (bool, Vec<LoadedModelInfo>) {
+    let (has, models, _, _) = probe_local_server();
+    (has, models)
+}
+
+/// The local server's `/api/status` capability flags:
+/// `(has_vision, has_embeddings)`. Shares the probe cache with
+/// [`probe_local_models`]; both are `(false, false)` for non-Vibe-Local
+/// servers (plain llama.cpp has no `/api/status`).
+pub fn probe_local_status() -> (bool, bool) {
+    let (_, _, vision, embeddings) = probe_local_server();
+    (vision, embeddings)
+}
+
+fn probe_local_server() -> (bool, Vec<LoadedModelInfo>, bool, bool) {
     let ep = llm_endpoint();
     {
         let c = LLM_CACHE.lock().unwrap();
         if c.endpoint == ep && c.at.is_some_and(|at| at.elapsed() < LLM_PROBE_TTL) {
-            return (c.has, c.models.clone());
+            return (c.has, c.models.clone(), c.has_vision, c.has_embeddings);
         }
     }
-    let (has, models) = probe_at(&ep);
+    let (has, models, vision, embeddings) = probe_at(&ep);
     let mut c = LLM_CACHE.lock().unwrap();
     c.endpoint = ep;
     c.at = Some(Instant::now());
     c.has = has;
     c.models = models.clone();
-    (has, models)
+    c.has_vision = vision;
+    c.has_embeddings = embeddings;
+    (has, models, vision, embeddings)
 }
 
-fn probe_at(base: &str) -> (bool, Vec<LoadedModelInfo>) {
+fn probe_at(base: &str) -> (bool, Vec<LoadedModelInfo>, bool, bool) {
     let agent = ureq::AgentBuilder::new().timeout(LLM_PROBE_TIMEOUT).build();
     let Ok(resp) = agent.get(&format!("{base}/v1/models")).call() else {
-        return (false, Vec::new());
+        return (false, Vec::new(), false, false);
     };
     if resp.status() != 200 {
-        return (false, Vec::new());
+        return (false, Vec::new(), false, false);
     }
-    let Ok(json) = resp.into_json::<serde_json::Value>() else {
-        return (true, Vec::new());
-    };
     let mut models = Vec::new();
-    if let Some(data) = json["data"].as_array() {
+    if let Ok(json) = resp.into_json::<serde_json::Value>()
+        && let Some(data) = json["data"].as_array()
+    {
         for m in data.iter().take(16) {
             if let Some(id) = m["id"].as_str()
                 && !id.is_empty()
@@ -107,7 +129,26 @@ fn probe_at(base: &str) -> (bool, Vec<LoadedModelInfo>) {
             }
         }
     }
-    (true, models)
+    // Authoritative capability flags from Vibe-Link's /api/status
+    // (has_vision / has_embeddings). Best-effort: any failure (foreign
+    // server, LAN token required, old build) leaves both false and the
+    // per-model flags / name hints in infer_capabilities still apply.
+    // Older field names (mmproj_loaded / embedding) are accepted too.
+    let (mut has_vision, mut has_embeddings) = (false, false);
+    if let Ok(resp) = agent.get(&format!("{base}/api/status")).call()
+        && resp.status() == 200
+        && let Ok(status) = resp.into_json::<serde_json::Value>()
+    {
+        has_vision = status["has_vision"]
+            .as_bool()
+            .or_else(|| status["mmproj_loaded"].as_bool())
+            .unwrap_or(false);
+        has_embeddings = status["has_embeddings"]
+            .as_bool()
+            .or_else(|| status["embedding"].as_bool())
+            .unwrap_or(false);
+    }
+    (true, models, has_vision, has_embeddings)
 }
 
 /// Model-name hints for vision models whose server reports no `mmproj`
@@ -136,28 +177,37 @@ const EMBED_NAME_HINTS: [&str; 9] = [
     "embeddinggemma",
 ];
 
-/// Infer heterogeneous capability labels from the models a local server
+/// Infer heterogeneous capability labels from what a local server
 /// reports. Pure and deterministic so it is unit-testable without a live
-/// server: `llm` for any loaded model, `vision` when a model carries an
-/// mmproj projector (or a vision name hint), `embed_rag` when a model was
-/// loaded in embedding mode (or is a known embedding model). Labels are
-/// returned in `proto::CAPABILITIES` order, deduplicated.
-pub fn infer_capabilities(has_llm: bool, models: &[LoadedModelInfo]) -> Vec<String> {
-    if !has_llm || models.is_empty() {
+/// server: `llm` for any responding server, `vision` when `/api/status`
+/// reports `has_vision` (or a model carries an mmproj projector, or a
+/// vision name hint matches), `embed_rag` when `/api/status` reports
+/// `has_embeddings` (or a model was loaded in embedding mode, or is a
+/// known embedding model). Labels are returned in `proto::CAPABILITIES`
+/// order, deduplicated.
+pub fn infer_capabilities(
+    has_llm: bool,
+    models: &[LoadedModelInfo],
+    status_vision: bool,
+    status_embeddings: bool,
+) -> Vec<String> {
+    if !has_llm {
         return Vec::new();
     }
     let mut caps = vec!["llm".to_string()];
-    let vision = models.iter().any(|m| {
-        let id = m.id.to_lowercase();
-        m.mmproj || VISION_NAME_HINTS.iter().any(|h| id.contains(h))
-    });
+    let vision = status_vision
+        || models.iter().any(|m| {
+            let id = m.id.to_lowercase();
+            m.mmproj || VISION_NAME_HINTS.iter().any(|h| id.contains(h))
+        });
     if vision {
         caps.push("vision".to_string());
     }
-    let embed = models.iter().any(|m| {
-        let id = m.id.to_lowercase();
-        m.embedding || EMBED_NAME_HINTS.iter().any(|h| id.contains(h))
-    });
+    let embed = status_embeddings
+        || models.iter().any(|m| {
+            let id = m.id.to_lowercase();
+            m.embedding || EMBED_NAME_HINTS.iter().any(|h| id.contains(h))
+        });
     if embed {
         caps.push("embed_rag".to_string());
     }
@@ -190,10 +240,11 @@ pub fn detect() -> Caps {
         caps.temp_c = t;
     }
     let (has, models) = probe_local_models();
+    let (status_vision, status_embeddings) = probe_local_status();
     caps.has_local_llm = has;
     caps.local_llm_models = models.iter().map(|m| m.id.clone()).collect();
     caps.loaded_models = caps.local_llm_models.clone();
-    caps.capabilities = infer_capabilities(has, &models);
+    caps.capabilities = infer_capabilities(has, &models, status_vision, status_embeddings);
     caps
 }
 
@@ -598,37 +649,78 @@ mod tests {
 
     #[test]
     fn capability_inference_from_models() {
-        // No server / no models → no capabilities.
-        assert!(infer_capabilities(false, &[info("m.gguf", true, true)]).is_empty());
-        assert!(infer_capabilities(true, &[]).is_empty());
+        // No server → no capabilities, whatever the flags claim.
+        assert!(infer_capabilities(false, &[info("m.gguf", true, true)], true, true).is_empty());
+        // A responding server with nothing loaded still offers llm.
+        assert_eq!(infer_capabilities(true, &[], false, false), vec!["llm"]);
         // Plain chat model → llm only.
         assert_eq!(
-            infer_capabilities(true, &[info("qwen2.5-7b-Q4_K_M.gguf", false, false)]),
+            infer_capabilities(
+                true,
+                &[info("qwen2.5-7b-Q4_K_M.gguf", false, false)],
+                false,
+                false
+            ),
             vec!["llm"]
         );
         // mmproj flag → vision.
         assert_eq!(
-            infer_capabilities(true, &[info("qwen2.5-vl-7b.gguf", true, false)]),
+            infer_capabilities(
+                true,
+                &[info("qwen2.5-vl-7b.gguf", true, false)],
+                false,
+                false
+            ),
             vec!["llm", "vision"]
         );
         // Vision name hint works without the flag (foreign servers).
         assert_eq!(
-            infer_capabilities(true, &[info("llava-v1.6-34b.gguf", false, false)]),
+            infer_capabilities(
+                true,
+                &[info("llava-v1.6-34b.gguf", false, false)],
+                false,
+                false
+            ),
             vec!["llm", "vision"]
         );
         // Embedding flag → embed_rag.
         assert_eq!(
-            infer_capabilities(true, &[info("some-model.gguf", false, true)]),
+            infer_capabilities(true, &[info("some-model.gguf", false, true)], false, false),
             vec!["llm", "embed_rag"]
         );
         // Embedding name hint works without the flag.
         assert_eq!(
-            infer_capabilities(true, &[info("bge-large-en-v1.5-Q8_0.gguf", false, false)]),
+            infer_capabilities(
+                true,
+                &[info("bge-large-en-v1.5-Q8_0.gguf", false, false)],
+                false,
+                false
+            ),
             vec!["llm", "embed_rag"]
         );
         assert_eq!(
-            infer_capabilities(true, &[info("nomic-embed-text-v1.5.gguf", false, false)]),
+            infer_capabilities(
+                true,
+                &[info("nomic-embed-text-v1.5.gguf", false, false)],
+                false,
+                false
+            ),
             vec!["llm", "embed_rag"]
+        );
+        // /api/status flags are authoritative on their own: a plainly
+        // named chat model still yields vision / embed_rag when the
+        // local Vibe-Link reports has_vision / has_embeddings.
+        assert_eq!(
+            infer_capabilities(true, &[info("plain-chat.gguf", false, false)], true, false),
+            vec!["llm", "vision"]
+        );
+        assert_eq!(
+            infer_capabilities(true, &[info("plain-chat.gguf", false, false)], false, true),
+            vec!["llm", "embed_rag"]
+        );
+        assert_eq!(
+            infer_capabilities(true, &[], true, true),
+            vec!["llm", "vision", "embed_rag"]
         );
         // Multiple models combine, in stable capability order.
         assert_eq!(
@@ -637,7 +729,9 @@ mod tests {
                 &[
                     info("bge-small.gguf", false, false),
                     info("moondream2.gguf", false, false),
-                ]
+                ],
+                false,
+                false
             ),
             vec!["llm", "vision", "embed_rag"]
         );

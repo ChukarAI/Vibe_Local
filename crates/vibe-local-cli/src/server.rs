@@ -380,8 +380,10 @@ fn route(
                 "engine": status.engine,
                 "idle_timeout_secs": status.idle_timeout_secs,
                 "thermal": {"celsius": status.thermal_celsius, "state": status.thermal_state},
-                "mmproj_loaded": status.mmproj_loaded,
-                "embedding": status.embedding,
+                "has_vision": status.has_vision,
+                "has_embeddings": status.has_embeddings,
+                "mmproj_loaded": status.has_vision,
+                "embedding": status.has_embeddings,
                 "lan": state.config.lan,
                 "port": state.config.port,
             })))
@@ -505,7 +507,7 @@ fn route(
                 data.push(json!({
                     "id": id, "object": "model", "created": util::unix_now(),
                     "owned_by": "vibe-local", "backend": status.backend, "engine": status.engine,
-                    "mmproj": status.mmproj_loaded, "embedding": status.embedding,
+                    "mmproj": status.has_vision, "embedding": status.has_embeddings,
                 }));
             }
             Ok(ok_json(json!({"object": "list", "data": data})))
@@ -633,6 +635,7 @@ fn route(
                 "object": "list",
                 "data": data,
                 "model": model_id,
+                "engine": reply.engine,
                 "usage": {
                     "prompt_tokens": reply.prompt_tokens,
                     "total_tokens": reply.prompt_tokens,
@@ -1536,6 +1539,8 @@ mod tests {
         );
         let body: serde_json::Value = resp.into_json().unwrap();
         assert_eq!(body["object"], "list");
+        // The producing engine is labeled in the body, not just headers.
+        assert_eq!(body["engine"], "builtin-microeval");
         let data = body["data"].as_array().unwrap();
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["index"], 0);
@@ -1574,6 +1579,11 @@ mod tests {
         let models: serde_json::Value = get(&format!("{base}/v1/models")).into_json().unwrap();
         assert_eq!(models["data"][0]["embedding"], true);
         assert_eq!(models["data"][0]["mmproj"], false);
+
+        // /api/status reports the spec field names for the same flags.
+        let status: serde_json::Value = get(&format!("{base}/api/status")).into_json().unwrap();
+        assert_eq!(status["has_embeddings"], true);
+        assert_eq!(status["has_vision"], false);
         handle.shutdown();
     }
 

@@ -129,11 +129,11 @@ pub struct EngineStatus {
     pub thermal_state: ThermalState,
     pub internal_port: u16,
     /// A multimodal projector (`mmproj_path`) is loaded with the model.
-    #[serde(default)]
-    pub mmproj_loaded: bool,
+    #[serde(default, alias = "mmproj_loaded")]
+    pub has_vision: bool,
     /// The model was loaded with the `embedding` flag (`--embedding`).
-    #[serde(default)]
-    pub embedding: bool,
+    #[serde(default, alias = "embedding")]
+    pub has_embeddings: bool,
 }
 
 /// Result of an embeddings request: one vector per input, in input order.
@@ -541,8 +541,8 @@ fn status_of(
         thermal_celsius: thermal.current_reading(),
         thermal_state: thermal.state(),
         internal_port: port,
-        mmproj_loaded: loaded.as_ref().is_some_and(|m| m.req.mmproj_path.is_some()),
-        embedding: loaded.as_ref().is_some_and(|m| m.req.embedding),
+        has_vision: loaded.as_ref().is_some_and(|m| m.req.mmproj_path.is_some()),
+        has_embeddings: loaded.as_ref().is_some_and(|m| m.req.embedding),
     }
 }
 
@@ -1324,12 +1324,12 @@ mod tests {
                 })
                 .unwrap();
             let status = engine.status().unwrap();
-            assert!(status.mmproj_loaded);
-            assert!(status.embedding);
+            assert!(status.has_vision);
+            assert!(status.has_embeddings);
             engine.unload();
             let status = engine.status().unwrap();
-            assert!(!status.mmproj_loaded);
-            assert!(!status.embedding);
+            assert!(!status.has_vision);
+            assert!(!status.has_embeddings);
         }
         engine.shutdown();
     }
