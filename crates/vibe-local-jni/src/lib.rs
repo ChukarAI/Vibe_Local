@@ -289,7 +289,7 @@ fn api_set_data_dir(data_dir: &str) -> Value {
 
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
-use jni::sys::{jboolean, jdouble, jint, jstring};
+use jni::sys::{jboolean, jdouble, jint, jlong, jstring};
 
 fn jstr(env: &mut JNIEnv, s: &JString) -> String {
     env.get_string(s).map(|v| v.into()).unwrap_or_default()
@@ -486,14 +486,51 @@ static GRID_AGENT: Mutex<Option<Arc<vibe_local_cluster::AgentHandle>>> = Mutex::
 static GRID_COORDINATOR: Mutex<Option<Arc<vibe_local_cluster::CoordinatorHandle>>> =
     Mutex::new(None);
 
+/// Parse the `clusterAgentStart` capabilities argument: empty (=
+/// auto-detect), a comma-separated list (`"llm,embed_rag"`), or a JSON
+/// array (`["llm","vision"]`). Labels are trimmed, lowercased,
+/// deduplicated (order preserved) and validated against
+/// `proto::CAPABILITIES`; an unknown label is an error, never a silent
+/// drop.
+fn parse_capabilities(input: &str) -> anyhow::Result<Vec<String>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let raw: Vec<String> = if trimmed.starts_with('[') {
+        serde_json::from_str::<Vec<String>>(trimmed)
+            .map_err(|e| anyhow::anyhow!("invalid capabilities JSON array: {e}"))?
+    } else {
+        trimmed.split(',').map(|s| s.to_string()).collect()
+    };
+    let mut out: Vec<String> = Vec::new();
+    for label in raw {
+        let label = label.trim().to_lowercase();
+        if label.is_empty() {
+            continue;
+        }
+        anyhow::ensure!(
+            vibe_local_cluster::proto::CAPABILITIES.contains(&label.as_str()),
+            "unknown capability '{label}' (known: {})",
+            vibe_local_cluster::proto::CAPABILITIES.join(", ")
+        );
+        if !out.contains(&label) {
+            out.push(label);
+        }
+    }
+    Ok(out)
+}
+
 fn api_cluster_agent_start(
     coordinator_url: &str,
     key: &str,
     workers: i32,
     name: &str,
     data_dir: &str,
+    capabilities: &str,
 ) -> Value {
     wrap_call(|| {
+        let capabilities = parse_capabilities(capabilities)?;
         let mut guard = GRID_AGENT.lock().unwrap();
         if let Some(old) = guard.take() {
             old.stop();
@@ -510,11 +547,28 @@ fn api_cluster_agent_start(
             key: key.to_string(),
             node_id_file: dir.join(".vibe-node-id").to_string_lossy().into_owned(),
             workers: workers.clamp(1, 16) as usize,
+            capabilities: capabilities.clone(),
             ..Default::default()
         })?;
         let node_id = handle.node_id();
         *guard = Some(handle);
-        Ok(json!({"node_id": node_id, "coordinator": coordinator_url}))
+        Ok(json!({
+            "node_id": node_id,
+            "coordinator": coordinator_url,
+            "capabilities": capabilities,
+        }))
+    })
+}
+
+/// Broadcast `VIBE_GRID_DISCOVER_V1` on UDP :20132 and collect coordinator
+/// replies for up to `timeout_ms` (clamped to 100..=30_000). Returns the
+/// raw discovery reply objects (`{service, coordinator_port, host,
+/// version}`); an empty array simply means no coordinator answered.
+fn api_cluster_discover(timeout_ms: i64) -> Value {
+    wrap_call(|| {
+        let timeout = std::time::Duration::from_millis(timeout_ms.clamp(100, 30_000) as u64);
+        let found = vibe_local_cluster::grid_discovery::discover(timeout);
+        Ok(json!(found))
     })
 }
 
@@ -602,14 +656,25 @@ pub extern "system" fn Java_com_vibelocal_app_core_VibeLocalBridge_clusterAgentS
     workers: jint,
     name: JString,
     data_dir: JString,
+    capabilities: JString,
 ) -> jstring {
     let url = jstr(&mut env, &coordinator_url);
     let key = jstr(&mut env, &key);
     let name = jstr(&mut env, &name);
     let dir = jstr(&mut env, &data_dir);
+    let caps = jstr(&mut env, &capabilities);
     guarded(&mut env, move || {
-        api_cluster_agent_start(&url, &key, workers, &name, &dir)
+        api_cluster_agent_start(&url, &key, workers, &name, &dir, &caps)
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_vibelocal_app_core_VibeLocalBridge_clusterDiscoverJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    timeout_ms: jlong,
+) -> jstring {
+    guarded(&mut env, move || api_cluster_discover(timeout_ms))
 }
 
 #[unsafe(no_mangle)]
@@ -798,6 +863,16 @@ pub unsafe extern "C" fn vibe_local_chat_messages(
     to_c_string(api_chat_messages(&messages, strip_think != 0))
 }
 
+/// C-ABI mirror of the JNI `clusterDiscoverJson`: broadcast
+/// `VIBE_GRID_DISCOVER_V1` and return the standard envelope whose `data`
+/// is the array of discovery replies (possibly empty).
+#[unsafe(no_mangle)]
+pub extern "C" fn vibe_local_cluster_discover(timeout_ms: u32) -> *mut c_char {
+    let value = std::panic::catch_unwind(|| api_cluster_discover(i64::from(timeout_ms)))
+        .unwrap_or_else(|_| json!({"ok": false, "error": "native panic"}));
+    to_c_string(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,11 +1036,80 @@ mod tests {
             1,
             "jni-test-agent",
             &dir.path().to_string_lossy(),
+            "",
         );
         assert_eq!(agent["ok"], true, "{agent}");
         assert!(agent["data"]["node_id"].as_str().unwrap().starts_with('n'));
         let stopped = api_cluster_agent_stop();
         assert_eq!(stopped["ok"], true);
+        let stopped = api_cluster_coordinator_stop();
+        assert_eq!(stopped["ok"], true);
+    }
+
+    #[test]
+    fn capabilities_parsing() {
+        // Empty = auto-detect.
+        assert!(parse_capabilities("").unwrap().is_empty());
+        assert!(parse_capabilities("   ").unwrap().is_empty());
+        // Comma-separated, trimmed, lowercased, deduplicated.
+        assert_eq!(
+            parse_capabilities("llm, embed_rag ,LLM").unwrap(),
+            vec!["llm", "embed_rag"]
+        );
+        // JSON array form.
+        assert_eq!(
+            parse_capabilities(r#"["vision","stt"]"#).unwrap(),
+            vec!["vision", "stt"]
+        );
+        // Unknown labels and malformed JSON are errors, never silent.
+        assert!(parse_capabilities("llm,teleport").is_err());
+        assert!(parse_capabilities("[not json").is_err());
+    }
+
+    #[test]
+    fn cluster_agent_capabilities_and_discover_via_api() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        temp_data_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let started = api_cluster_coordinator_start(
+            "127.0.0.1:0",
+            "",
+            false,
+            &dir.path().join("grid-state.gz").to_string_lossy(),
+        );
+        assert_eq!(started["ok"], true, "{started}");
+        let port = started["data"]["port"].as_u64().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        // Unknown capability is rejected before any agent starts.
+        let bad = api_cluster_agent_start(
+            &base,
+            "",
+            1,
+            "jni-bad-caps",
+            &dir.path().to_string_lossy(),
+            "llm,teleport",
+        );
+        assert_eq!(bad["ok"], false, "{bad}");
+        // JSON-array capabilities are accepted and echoed back.
+        let agent = api_cluster_agent_start(
+            &base,
+            "",
+            1,
+            "jni-caps-agent",
+            &dir.path().to_string_lossy(),
+            r#"["llm","embed_rag"]"#,
+        );
+        assert_eq!(agent["ok"], true, "{agent}");
+        assert_eq!(agent["data"]["capabilities"], json!(["llm", "embed_rag"]));
+        let stopped = api_cluster_agent_stop();
+        assert_eq!(stopped["ok"], true);
+        // Discovery returns the standard envelope with an array payload;
+        // in sandboxes without UDP broadcast delivery the array is
+        // legitimately empty, so only the shape is asserted here (the
+        // responder round-trip itself is covered by cluster tests).
+        let found = parse(vibe_local_cluster_discover(200));
+        assert_eq!(found["ok"], true, "{found}");
+        assert!(found["data"].is_array());
         let stopped = api_cluster_coordinator_stop();
         assert_eq!(stopped["ok"], true);
     }

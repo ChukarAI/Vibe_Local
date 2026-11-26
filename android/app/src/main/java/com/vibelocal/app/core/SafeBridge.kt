@@ -51,8 +51,11 @@ object SafeBridge {
     fun setIdleTimeout(seconds: Int): BridgeResult =
         invoke { VibeLocalBridge.setIdleTimeout(seconds) }
 
-    fun clusterAgentStart(coordinatorUrl: String, key: String, workers: Int, name: String, dataDir: String): BridgeResult =
-        invoke { VibeLocalBridge.clusterAgentStart(coordinatorUrl, key, workers, name, dataDir) }
+    fun clusterAgentStart(coordinatorUrl: String, key: String, workers: Int, name: String, dataDir: String, capabilities: String): BridgeResult =
+        invoke { VibeLocalBridge.clusterAgentStart(coordinatorUrl, key, workers, name, dataDir, capabilities) }
+
+    fun clusterDiscoverJson(timeoutMs: Long): BridgeResult =
+        invoke { VibeLocalBridge.clusterDiscoverJson(timeoutMs) }
 
     fun clusterAgentStop(): BridgeResult = invoke { VibeLocalBridge.clusterAgentStop() }
 

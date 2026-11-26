@@ -43,7 +43,8 @@ object VibeLocalBridge {
     external fun chat(prompt: String, stripThink: Boolean): String
 
     /** LoadRequest JSON: path required; ctx 0/omitted auto-sizes; optional
-     *  draft_model_path / draft_ngl / draft_max for speculative decoding. */
+     *  draft_model_path / draft_ngl / draft_max for speculative decoding,
+     *  mmproj_path for vision models, embedding=true for embedding mode. */
     external fun loadModel(configJson: String): String
 
     /** JSON array of OpenAI-style {"role","content"} messages (multi-turn). */
@@ -57,7 +58,13 @@ object VibeLocalBridge {
 
     // --- Vibe Grid cluster (compost v0.7.0 wire-compatible) ---
 
-    external fun clusterAgentStart(coordinatorUrl: String, key: String, workers: Int, name: String, dataDir: String): String
+    /** [capabilities]: comma-separated labels ("llm,embed_rag") or a JSON
+     *  array; empty string = auto-detect on the Rust side. */
+    external fun clusterAgentStart(coordinatorUrl: String, key: String, workers: Int, name: String, dataDir: String, capabilities: String): String
+
+    /** Broadcasts VIBE_GRID_DISCOVER_V1 on UDP :20132 and returns the
+     *  discovered coordinators as a JSON array in the data envelope. */
+    external fun clusterDiscoverJson(timeoutMs: Long): String
 
     external fun clusterAgentStop(): String
 

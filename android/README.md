@@ -114,11 +114,23 @@ hardcoded.
 `object VibeLocalBridge` (instance methods on the Kotlin `object` singleton)
 exposes exactly: `scanHardware`, `recommend`, `inspectGguf`, `runVibeMark`,
 `leaderboard`, `submitLeaderboard`, `startServer`, `stopServer`,
-`serverStatus`, `chat`, `unloadModel`, `setThermalReading`, `setIdleTimeout`.
+`serverStatus`, `chat`, `loadModel`, `chatMessages`, `unloadModel`,
+`setThermalReading`, `setIdleTimeout`, and the Vibe Grid
+surface: `clusterAgentStart` (with a capabilities argument),
+`clusterAgentStop`, `clusterStatusJson`, `clusterPlanMoeJson`,
+`clusterCoordinatorStart`, `clusterCoordinatorStop`, `clusterDiscoverJson`.
 Every function returns a JSON string `{"ok":true,"data":...}` or
-`{"ok":false,"error":"..."}`. The Rust crate should bind via
-`RegisterNatives` or `Java_com_vibelocal_app_core_VibeLocalBridge_<name>`
-symbols. ProGuard keeps these names (see `app/proguard-rules.pro`).
+`{"ok":false,"error":"..."}`. The Rust crate binds them via
+`Java_com_vibelocal_app_core_VibeLocalBridge_<name>` symbols. ProGuard
+keeps these names (see `app/proguard-rules.pro`).
+
+In native mode the repository loads models through JNI `loadModel`
+(LoadRequest JSON — `path`, `backend`, `ngl`, `ctx`, optional
+`draft_model_path`, `mmproj_path`, `embedding`) and chats through JNI
+`chatMessages` with the structured OpenAI `{role, content}` array — no
+loopback HTTP round-trip and no transcript flattening. The HTTP fallback
+(same calls against a remote Vibe-Link host) applies only when the
+native library failed to load.
 
 ### HTTP API
 
@@ -195,10 +207,6 @@ header automatically whenever a token is configured.
 - SAF/OTG: direct filesystem access to removable volumes is subject to
   scoped-storage/FUSE policy. If the native engine cannot open a derived
   `/storage/<volume>` path on a given OEM build, use internal storage.
-- The JNI bridge has no `loadModel()`; loading goes through `POST /api/load`.
-  In native mode the app starts the loopback server (`lan=false`) on demand.
-- `chat()` JNI takes a single prompt string, so the transcript is flattened
-  for native mode; HTTP mode sends the full OpenAI messages array.
 - Leaderboard submission is native-only (no HTTP submit endpoint is defined
   in the API contract).
 - Android 15 limits `dataSync` foreground services to ~6 h per day; the
@@ -214,11 +222,21 @@ wire-compatible with the original Go protocol (`/api/v1/*`).
 ### Pairing as a worker
 
 1. On the PC: `vibe-local cluster coordinator --addr 0.0.0.0:7900 --key <secret> --state grid-state.gz`
-2. On the phone (Vibe Grid tab): enter `http://<pc-lan-ip>:7900` and the fleet
-   key, choose worker concurrency (1–16), press **Start worker**.
+2. On the phone (Vibe Grid tab): press **Discover LAN coordinator** — the
+   app broadcasts `VIBE_GRID_DISCOVER_V1` on UDP :20132 via JNI
+   `clusterDiscoverJson` and fills the coordinator URL from the replies
+   (or type `http://<pc-lan-ip>:7900` manually), enter the fleet key,
+   choose worker concurrency (1–16), press **Start worker**.
 3. The agent joins outward over Wi-Fi — **no inbound ports are opened on the
    phone**. It polls for tasks, executes them locally, renews leases with a
    5s heartbeat, and uploads gzip-compressed results.
+
+**Capability chips:** the worker card offers selectable capability labels
+(`llm`, `vision`, `embed_rag`, `stt`, `tts`). Selected labels are passed
+to `clusterAgentStart` and advertised to the fleet, so capability-filtered
+jobs (e.g. `embed_batch` → `embed_rag`) can lease to this phone. Leaving
+all chips unselected keeps Rust-side auto-detection (llm / vision /
+embed_rag from the local Vibe-Link server's `/api/status` and models).
 
 Safety guards are enforced natively: battery <30% (on battery) pauses work,
 CPU >80°C or Android battery >45°C pauses work, and the coordinator's
@@ -243,6 +261,11 @@ persistent state snapshot under the app data dir.
 
 ### JNI surface
 
-`clusterAgentStart / clusterAgentStop / clusterStatusJson /
-clusterPlanMoeJson / clusterCoordinatorStart / clusterCoordinatorStop` —
-all return the standard `{"ok":..,"data":..}` envelope via `SafeBridge`.
+`clusterAgentStart` (now with a trailing `capabilities` argument:
+comma-separated labels or a JSON array, empty = auto-detect) /
+`clusterAgentStop / clusterStatusJson / clusterPlanMoeJson /
+clusterCoordinatorStart / clusterCoordinatorStop / clusterDiscoverJson`
+— all return the standard `{"ok":..,"data":..}` envelope via `SafeBridge`.
+`clusterDiscoverJson(timeoutMs)` wraps
+`vibe_local_cluster::grid_discovery::discover`; its C-ABI mirror is
+`vibe_local_cluster_discover(timeout_ms)`.

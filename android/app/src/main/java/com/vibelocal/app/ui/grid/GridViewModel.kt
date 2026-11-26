@@ -122,6 +122,13 @@ data class GridUiState(
     val coordinator: String = "",
     val key: String = "",
     val workers: Int = 2,
+    /** Explicit capability labels to advertise; empty = auto-detect. */
+    val capabilities: Set<String> = emptySet(),
+    /** Coordinator base URLs found by the last LAN discovery run. */
+    val discoveredUrls: List<String> = emptyList(),
+    val discovering: Boolean = false,
+    /** Set after a discovery run that found nobody. */
+    val discoverNote: String? = null,
     val agentRunning: Boolean = false,
     val agentNodeId: String? = null,
     val coordinatorRunning: Boolean = false,
@@ -137,6 +144,9 @@ data class GridUiState(
     val submitStatus: String? = null,
 ) {
     companion object {
+        /** Capability labels the worker can advertise (Wave 4 Task 2). */
+        val CAPABILITY_OPTIONS = listOf("llm", "vision", "embed_rag", "stt", "tts")
+
         val MOE_MODELS = listOf(
             "OLMoE-1B-7B-0924-Instruct",
             "Granite-3.1-3B-A800M-Instruct",
@@ -172,6 +182,36 @@ class GridViewModel(private val container: AppContainer) : ViewModel() {
     fun setWorkers(n: Int) {
         container.prefs.gridWorkers = n
         _state.update { it.copy(workers = n.coerceIn(1, 16)) }
+    }
+
+    fun toggleCapability(label: String) {
+        _state.update {
+            it.copy(
+                capabilities = if (label in it.capabilities) it.capabilities - label else it.capabilities + label,
+            )
+        }
+    }
+
+    /** UDP-broadcast for LAN coordinators (VIBE_GRID_DISCOVER_V1, :20132). */
+    fun discoverCoordinators() {
+        viewModelScope.launch {
+            _state.update { it.copy(discovering = true, discoverNote = null) }
+            container.repository.gridDiscover()
+                .onSuccess { urls ->
+                    _state.update {
+                        it.copy(
+                            discovering = false,
+                            discoveredUrls = urls,
+                            discoverNote = if (urls.isEmpty()) "none" else null,
+                        )
+                    }
+                    // A single answer is unambiguous: fill the field.
+                    if (urls.size == 1) setCoordinator(urls[0])
+                }
+                .onFailure { e ->
+                    _state.update { it.copy(discovering = false, error = e.message) }
+                }
+        }
     }
 
     fun setPlanModel(model: String) = _state.update { it.copy(planModel = model) }
@@ -260,7 +300,7 @@ class GridViewModel(private val container: AppContainer) : ViewModel() {
     fun startAgent() {
         viewModelScope.launch {
             _state.update { it.copy(busy = true, error = null) }
-            container.repository.gridAgentStart(_state.value.workers)
+            container.repository.gridAgentStart(_state.value.workers, _state.value.capabilities.toList())
                 .onSuccess { data ->
                     _state.update {
                         it.copy(agentRunning = true, agentNodeId = data.optString("node_id"), busy = false)

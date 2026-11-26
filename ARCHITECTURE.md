@@ -172,7 +172,7 @@ Real sensors: Linux/Android `/sys/class/thermal/thermal_zone*/temp` (CPU/SoC zon
 
 ## 5. JNI bridge (`vibe-local-jni`)
 
-`cdylib` + `staticlib` + `rlib`. All `Java_com_vibelocal_app_core_VibeLocalBridge_*` functions return JSON strings (`{"ok":true,"data":…}` / `{"ok":false,"error":…}`), wrap panics via `catch_unwind`, and share one global `BridgeState` (DB + engine + server handle). The Android app runs the **same server code** as the PC. C-ABI mirrors (`vibe_local_*`) with explicit `vibe_local_free_string` ownership. Wave 3 adds `loadModel(configJson)` (full `LoadRequest` JSON → `engine.load`, returns `{loaded_model, backend, engine}`) and `chatMessages(messagesJson, stripThink)` (OpenAI-style message array → `engine.chat_messages`, unflattened multi-turn) with C-ABI mirrors `vibe_local_load_model` / `vibe_local_chat_messages`; every pre-existing symbol is preserved. Kotlin declarations live in `VibeLocalBridge.kt`, guarded wrappers in `SafeBridge.kt`.
+`cdylib` + `staticlib` + `rlib`. All `Java_com_vibelocal_app_core_VibeLocalBridge_*` functions return JSON strings (`{"ok":true,"data":…}` / `{"ok":false,"error":…}`), wrap panics via `catch_unwind`, and share one global `BridgeState` (DB + engine + server handle). The Android app runs the **same server code** as the PC. C-ABI mirrors (`vibe_local_*`) with explicit `vibe_local_free_string` ownership. Wave 3 adds `loadModel(configJson)` (full `LoadRequest` JSON → `engine.load`, returns `{loaded_model, backend, engine}`) and `chatMessages(messagesJson, stripThink)` (OpenAI-style message array → `engine.chat_messages`, unflattened multi-turn) with C-ABI mirrors `vibe_local_load_model` / `vibe_local_chat_messages`; every pre-existing symbol is preserved. Kotlin declarations live in `VibeLocalBridge.kt`, guarded wrappers in `SafeBridge.kt`. Wave 4 Task 2 makes the Android repository actually use them in native mode (JNI load + structured chat; HTTP is fallback-only) and extends the Grid surface: `clusterAgentStart` gains a trailing `capabilities` argument (comma-separated or JSON array, validated against `proto::CAPABILITIES`, empty = auto-detect) passed to `AgentConfig.capabilities`, and `clusterDiscoverJson(timeoutMs)` wraps `grid_discovery::discover` (UDP :20132) with C-ABI mirror `vibe_local_cluster_discover`, both returning the standard envelope.
 
 ## 6. Android app (`android/`)
 
@@ -311,7 +311,10 @@ measures the partition.
 - **JNI/Android:** `clusterAgentStart/Stop`, `clusterStatusJson`,
   `clusterPlanMoeJson`, `clusterCoordinatorStart/Stop`; fifth Compose tab with
   worker pairing, fleet status, MoE planner (Canvas shard bar), job submit and
-  coordinator mode. The phone joins outward — no inbound ports.
+  coordinator mode. The phone joins outward — no inbound ports. Wave 4 Task 2
+  adds `clusterDiscoverJson` (LAN coordinator discovery from the connection
+  card, one-tap URL fill) and capability chips (`llm`, `vision`, `embed_rag`,
+  `stt`, `tts`) on the worker card, passed through to the agent start.
 
 ## 15. Wave 2 verification
 
@@ -463,10 +466,19 @@ SO_REUSEADDR coexistence), jni 5
   Ubuntu for every push / pull request to `main`, in two jobs —
   `rust-gates` (fmt, clippy `-D warnings`, workspace tests) and
   `python-bench-selftest` — with `permissions: contents: read`.
+- **Android parity (Task 2)**: `VibeRepository` native mode now loads via
+  JNI `loadModel` (full LoadRequest incl. `mmproj_path` / `embedding`)
+  and chats via JNI `chatMessages` with the structured message array —
+  the loopback-server load path and transcript flattening are gone, and
+  HTTP remains only as the no-native-lib fallback. The Grid tab gains
+  LAN coordinator discovery (`clusterDiscoverJson`, §5) and capability
+  chips forwarded to `clusterAgentStart`. Kotlin is source-verified
+  (no Android SDK in the dev sandbox); all Rust JNI/C-ABI behavior is
+  covered by live host tests in `vibe-local-jni`.
 
 ## 19. Wave 4 verification
 
-190 workspace tests: core 48, engine 23, cluster 78, cli 36, jni 5 —
+192 workspace tests: core 48, engine 23, cluster 78, cli 36, jni 7 —
 including new coverage for mmproj validation + the embedding flag
 (serde defaults, missing/invalid GGUF rejection, status reporting),
 `/v1/embeddings` (single-string + array input, LAN auth 401, Host-guard

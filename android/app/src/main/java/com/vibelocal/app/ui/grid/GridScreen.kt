@@ -1,6 +1,7 @@
 package com.vibelocal.app.ui.grid
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +21,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -31,6 +33,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -106,7 +109,8 @@ fun GridScreen(vm: GridViewModel) {
 
 @Composable
 private fun ConnectionCard(state: GridUiState, vm: GridViewModel) {
-    var url by rememberSaveable { mutableStateOf(state.coordinator) }
+    // Keyed on state.coordinator so LAN discovery can fill the field.
+    var url by rememberSaveable(state.coordinator) { mutableStateOf(state.coordinator) }
     var key by rememberSaveable { mutableStateOf(state.key) }
     SectionCard(title = stringResource(R.string.grid_connection)) {
         OutlinedTextField(
@@ -135,14 +139,67 @@ private fun ConnectionCard(state: GridUiState, vm: GridViewModel) {
                 fontSize = 12.sp,
             )
         }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(
+                onClick = { vm.discoverCoordinators() },
+                enabled = !state.discovering,
+            ) { Text(stringResource(R.string.grid_discover)) }
+            if (state.discovering) {
+                Text(
+                    stringResource(R.string.grid_discovering),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                )
+            }
+        }
+        if (state.discoverNote == "none") {
+            Text(
+                stringResource(R.string.grid_discovered_none),
+                style = MaterialTheme.typography.bodySmall,
+                color = WarnAmber,
+            )
+        }
+        state.discoveredUrls.forEach { found ->
+            OutlinedButton(
+                onClick = {
+                    vm.setCoordinator(found)
+                    vm.setKey(key)
+                    vm.refresh()
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text(found) }
+        }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun WorkerCard(state: GridUiState, vm: GridViewModel) {
     SectionCard(title = stringResource(R.string.grid_worker)) {
         Text(
             stringResource(R.string.grid_worker_help),
+            style = MaterialTheme.typography.bodySmall,
+            color = TextSecondary,
+        )
+        Text(
+            stringResource(R.string.grid_capabilities),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+        ) {
+            GridUiState.CAPABILITY_OPTIONS.forEach { label ->
+                FilterChip(
+                    selected = label in state.capabilities,
+                    onClick = { vm.toggleCapability(label) },
+                    label = { Text(label, fontSize = 11.sp) },
+                )
+            }
+        }
+        Text(
+            stringResource(R.string.grid_capabilities_help),
             style = MaterialTheme.typography.bodySmall,
             color = TextSecondary,
         )

@@ -28,8 +28,8 @@ import java.io.IOException
  * Single source of truth for engine access.
  *
  * Transport selection:
- *  - native lib loaded  -> JNI via [SafeBridge] (and the loopback HTTP server
- *    for /api/load, which has no JNI counterpart in the bridge contract);
+ *  - native lib loaded  -> JNI via [SafeBridge] (loadModel / chatMessages
+ *    included — model loading and multi-turn chat never leave the process);
  *  - native lib missing -> HTTP fallback against the user-entered Vibe-Link
  *    host ([remoteHost]), with the optional remote token header.
  *
@@ -131,9 +131,10 @@ class VibeRepository(
     }
 
     /**
-     * The bridge contract has no loadModel() JNI function, so model loading
-     * always goes through POST /api/load. In native mode we first make sure
-     * the loopback server is up (starting it with lan=false when needed).
+     * Makes sure the loopback Vibe-Link server is up in native mode
+     * (starting it with lan=false when needed). Used by the HTTP fallback
+     * path of [loadModel] and by features that serve LAN clients; native
+     * model loading itself goes through JNI and does not need the server.
      */
     suspend fun ensureLocalServer(): Result<Unit> = withContext(Dispatchers.IO) {
         if (!nativeAvailable) return@withContext Result.success(Unit)
@@ -164,8 +165,33 @@ class VibeRepository(
 
     // ----------------------------------------------------------------- model
 
-    suspend fun loadModel(path: String, backend: String?, ngl: Int, ctx: Int): Result<Unit> =
+    /**
+     * Native mode: direct JNI `loadModel` with a LoadRequest JSON
+     * (path / backend / ngl / ctx plus optional draft_model_path,
+     * mmproj_path and embedding). HTTP fallback (no native lib):
+     * POST /api/load against the configured Vibe-Link host.
+     */
+    suspend fun loadModel(
+        path: String,
+        backend: String?,
+        ngl: Int,
+        ctx: Int,
+        draftModelPath: String? = null,
+        mmprojPath: String? = null,
+        embedding: Boolean = false,
+    ): Result<Unit> =
         withContext(Dispatchers.IO) {
+            if (nativeAvailable) {
+                val config = JSONObject()
+                    .put("path", path)
+                    .put("ngl", ngl)
+                    .put("ctx", ctx)
+                if (!backend.isNullOrBlank()) config.put("backend", backend)
+                if (!draftModelPath.isNullOrBlank()) config.put("draft_model_path", draftModelPath)
+                if (!mmprojPath.isNullOrBlank()) config.put("mmproj_path", mmprojPath)
+                if (embedding) config.put("embedding", true)
+                return@withContext bridgeToResult(SafeBridge.loadModel(config.toString())) { }
+            }
             val base = prepareHttp()
             val ensured = ensureLocalServer()
             if (ensured.isFailure) {
@@ -208,15 +234,18 @@ class VibeRepository(
     // ------------------------------------------------------------------ chat
 
     /**
-     * Native mode: bridge chat(prompt, stripThink). The bridge takes a single
-     * prompt string, so the transcript is flattened into a plain-text dialog.
-     * HTTP mode: full OpenAI messages array with the extra strip_think flag.
-     * [history] must already include the newest user message.
+     * Both modes send the structured OpenAI messages array built from
+     * [history]: native mode via JNI `chatMessages`, HTTP mode via
+     * POST /v1/chat/completions with the extra strip_think flag.
+     * [history] must already include the newest user message. [prompt] is
+     * the latest user text, kept for call-site compatibility.
      */
     suspend fun chat(prompt: String, history: List<ChatMessage>, stripThink: Boolean): Result<String> =
         withContext(Dispatchers.IO) {
             if (nativeAvailable) {
-                bridgeToResult(SafeBridge.chat(prompt, stripThink)) { data ->
+                bridgeToResult(
+                    SafeBridge.chatMessages(buildMessagesArray(history).toString(), stripThink),
+                ) { data ->
                     extractChatContent(data) ?: throw JSONException("No content in chat response")
                 }
             } else {
@@ -242,15 +271,46 @@ class VibeRepository(
 
     // ------------------------------------------------------------- vibe grid
 
-    /** Start the pull-based worker agent (native only; outward connections). */
-    suspend fun gridAgentStart(workers: Int): Result<JSONObject> = withContext(Dispatchers.IO) {
+    /**
+     * Start the pull-based worker agent (native only; outward connections).
+     * [capabilities] are the explicit labels to advertise (llm, vision,
+     * embed_rag, stt, tts, ...); empty = auto-detect on the Rust side.
+     */
+    suspend fun gridAgentStart(workers: Int, capabilities: List<String> = emptyList()): Result<JSONObject> = withContext(Dispatchers.IO) {
         if (!nativeAvailable) {
             return@withContext Result.failure(IOException("Grid worker requires the native engine"))
         }
         val dir = dataDirs.dataDirPath
         bridgeToResult(
-            SafeBridge.clusterAgentStart(prefs.gridCoordinator, prefs.gridKey, workers, android.os.Build.MODEL ?: "android", dir)
+            SafeBridge.clusterAgentStart(
+                prefs.gridCoordinator, prefs.gridKey, workers,
+                android.os.Build.MODEL ?: "android", dir,
+                capabilities.joinToString(","),
+            )
         ) { it as JSONObject }
+    }
+
+    /**
+     * Discover Vibe Grid coordinators on the LAN via the
+     * VIBE_GRID_DISCOVER_V1 UDP broadcast (:20132). Returns base URLs
+     * ("http://host:port") ready to paste into the coordinator field;
+     * an empty list means nobody answered within [timeoutMs].
+     */
+    suspend fun gridDiscover(timeoutMs: Long = 1500): Result<List<String>> = withContext(Dispatchers.IO) {
+        if (!nativeAvailable) {
+            return@withContext Result.failure(IOException("Grid discovery requires the native engine"))
+        }
+        bridgeToResult(SafeBridge.clusterDiscoverJson(timeoutMs)) { data ->
+            val urls = mutableListOf<String>()
+            val arr = data as? org.json.JSONArray
+            if (arr != null) for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val host = o.optString("host")
+                val port = o.optInt("coordinator_port", 7900)
+                if (host.isNotBlank()) urls.add("http://$host:$port")
+            }
+            urls.distinct()
+        }
     }
 
     suspend fun gridAgentStop(): Result<Unit> = withContext(Dispatchers.IO) {

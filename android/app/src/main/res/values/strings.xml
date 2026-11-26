@@ -214,6 +214,11 @@
     <string name="grid_coordinator_url">Coordinator URL (http://pc-ip:7900)</string>
     <string name="grid_fleet_key">Fleet key (X-Compost-Key)</string>
     <string name="grid_connect">Connect</string>
+    <string name="grid_discover">Discover LAN coordinator</string>
+    <string name="grid_discovering">Listening for coordinators…</string>
+    <string name="grid_discovered_none">No coordinators answered — type the URL manually.</string>
+    <string name="grid_capabilities">Advertised capabilities</string>
+    <string name="grid_capabilities_help">Selected roles are advertised to the fleet when the worker starts. None selected = auto-detect (llm / vision / embed_rag from the local server).</string>
     <string name="grid_connected">Connected</string>
     <string name="grid_disconnected">Coordinator unreachable</string>
     <string name="grid_worker">This phone as worker</string>
