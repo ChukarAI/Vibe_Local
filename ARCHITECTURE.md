@@ -240,7 +240,7 @@ semantics, v3 defaults) rather than Go gob.
 | `server` | Coordinator: tiny_http workers, gzip body decoding under a **9MiB cap (413)**, 8MiB job-input cap, 8 concurrent jobs, artifact assembly threads + **8-entry LRU** + disk offload, auth-before-cache (no LRU thrashing), state redaction, ETA/Waiting annotation, `/healthz`, Prometheus `/metrics` (compost metric names), 10s persistence loop, embedded CSP-safe dashboard |
 | `agent` | Outward-only worker: join w/ full-jitter backoff, poll batches, worker pool (1–16), `ExecMillis` strictly around execute, inflight epoch tracking + 5s heartbeats, async upload loop (gzip >4KiB), battery/thermal pause reasons, flush on stop |
 | `node` | Caps via core HardwareProbe + battery (Win `GetSystemPowerStatus`, Linux/Android sysfs, macOS pmset) + engine thermal; xorshift64 benchmark (identical kernel cross-arch); `.vibe-node-id` persistent UUIDv4 with SHA-256 hardware fingerprint fallback (hostname/os/arch/cores/MACs); `:20129` LLM probe (300ms, 10s cache) |
-| `workload` | Preset SPI + `mandelbrot` (exact tile geometry/palette, PNG, ≤0.05% edge-pixel replica tolerance), `primes` (6k±1, π-verified), `wordcount` (word-aligned map/reduce), `llm_batch` (JSONL/MD/lines, verify mode, live `:20129`), `embed_batch` (same input conventions; stamps `required_capability: "embed_rag"`; live chunks = one batched `:20129/v1/embeddings` request; artifact = ordered JSON array of `{index, text_hash, embedding, engine}` with dimension-consistency check), `moe_distributed` |
+| `workload` | Preset SPI + `mandelbrot` (exact tile geometry/palette, PNG, ≤0.05% edge-pixel replica tolerance), `primes` (6k±1, π-verified), `wordcount` (word-aligned map/reduce), `llm_batch` (JSONL/MD/lines, verify mode, live `:20129`), `embed_batch` (same input conventions; stamps `required_capability: "embed_rag"`; live chunks = one batched `:20129/v1/embeddings` request; artifact = ordered JSON array of `{index, text_hash, embedding, engine}` with dimension-consistency check), `vision_batch` (JSONL `{prompt, image_base64|data: image_url}` — remote URLs rejected as an SSRF guard, base64 validated at parse; stamps `required_capability: "vision"`; live = per-item multimodal `:20129/v1/chat/completions`; verify = deterministic summary hash labeled `verify`; artifact = ordered JSON array of `{index, prompt, image_sha256, response, engine}`), `moe_distributed` |
 | `persist` | Gzipped JSON snapshots v4 (v3-compatible defaults) |
 | `moe_grid` | Distributed MoE planner + fault-tolerant shard router (below) |
 | `grid_discovery` | UDP `VIBE_GRID_DISCOVER_V1` responder (port 20132) + broadcast `discover()` (Wave 3, §16) |
@@ -427,7 +427,7 @@ SO_REUSEADDR coexistence), jni 5
 `cargo test --workspace`, `python benchmarks/kaggle_10pillar_bench.py
 --self-test` (15/15).
 
-# Wave 4 — embeddings, vision loads, embed_batch
+# Wave 4 — embeddings, vision loads, embed_batch, vision_batch, Android CI
 
 ## 18. Wave 4 changes
 
@@ -475,21 +475,40 @@ SO_REUSEADDR coexistence), jni 5
   chips forwarded to `clusterAgentStart`. Kotlin is source-verified
   (no Android SDK in the dev sandbox); all Rust JNI/C-ABI behavior is
   covered by live host tests in `vibe-local-jni`.
+- **Task 3 — `vision_batch` + multimodal chat + real Android CI**:
+  `vision_batch` (§13) operationalizes the `vision` capability end to
+  end. `ChatMessage` now accepts OpenAI multimodal content-part arrays:
+  the array is preserved verbatim (`content_parts`) and re-serialized
+  as the message content so llama-server receives it intact, while
+  `content` holds the extracted text parts for the builtin fallback and
+  token accounting — malformed parts never panic. CI gains a third
+  job, `android-build`: JDK 17 (temurin) + Gradle 8.9 via
+  `gradle/actions/setup-gradle`, wrapper bootstrapped in `android/`
+  (the jar is not committed), `./gradlew assembleDebug` — the Android
+  app is compiled on every push, closing the source-verified-only gap
+  from Task 2.
 
 ## 19. Wave 4 verification
 
-192 workspace tests: core 48, engine 23, cluster 78, cli 36, jni 7 —
+200 workspace tests: core 48, engine 25, cluster 83, cli 37, jni 7 —
 including new coverage for mmproj validation + the embedding flag
 (serde defaults, missing/invalid GGUF rejection, status reporting),
 `/v1/embeddings` (single-string + array input, LAN auth 401, Host-guard
 421, body-limit 413, `X-Vibe-Router-Cost-Micros: 0`), capability
 inference (mmproj flag, embedding flag, name hints, combined models),
-and the end-to-end `embed_batch` pipeline (submission with preset-stamped
+the end-to-end `embed_batch` pipeline (submission with preset-stamped
 `required_capability`, no lease to a capability-less node, execution on
-the `embed_rag` node, JSON artifact assembly). Gates: `cargo fmt --all
--- --check` ✔, `cargo clippy --workspace --all-targets -- -D warnings`
-✔, `cargo test --workspace` ✔ (187/190 in the Linux sandbox where this
-wave was developed — the 3 remaining tests are the pre-existing UDP
-loopback discovery tests, which the sandbox blocks at OS level with
-EPERM on UDP `send_to`; they pass where UDP loopback is permitted, as
-in CI), `python benchmarks/kaggle_10pillar_bench.py --self-test` (15/15) ✔.
+the `embed_rag` node, JSON artifact assembly), multimodal
+`/v1/chat/completions` (content-part parsing/serialization round-trip,
+builtin answering from the extracted text part, image-only messages),
+and the end-to-end `vision_batch` pipeline (JSONL validation incl.
+remote-URL and malformed-base64 rejection, preset-stamped `vision`
+capability, capability-filtered leasing, deterministic verify artifact
+assembly). Gates: `cargo fmt --all -- --check` ✔, `cargo clippy
+--workspace --all-targets -- -D warnings` ✔, `cargo test --workspace`
+✔ (in the Linux sandbox where this wave was developed, the
+pre-existing UDP loopback discovery tests are blocked at OS level with
+EPERM on UDP `send_to` and fail intermittently; they pass where UDP
+loopback is permitted, as in CI), `python
+benchmarks/kaggle_10pillar_bench.py --self-test` (15/15) ✔. CI runs
+three jobs: `rust-gates`, `python-bench-selftest`, `android-build`.

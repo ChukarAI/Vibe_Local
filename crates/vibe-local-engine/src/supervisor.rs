@@ -113,10 +113,118 @@ pub struct ChatReply {
 }
 
 /// OpenAI-style chat message, passed through to llama-server unflattened.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `content` may arrive either as a plain string or as a multimodal
+/// content-part array (`[{"type":"text","text":...},{"type":"image_url",
+/// ...}]`). The array form is preserved verbatim in `content_parts` and
+/// re-serialized as the message `content`, so llama-server receives the
+/// multimodal payload intact; `content` then holds the concatenated
+/// text parts, which is what the builtin fallback (and token accounting)
+/// consumes. Images never reach the builtin — it is a text-only engine
+/// and stays labeled `builtin-microeval`.
+#[derive(Debug, Clone)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Raw OpenAI content-part array when the message arrived in
+    /// multimodal form; `None` for plain-string messages.
+    pub content_parts: Option<serde_json::Value>,
+}
+
+impl ChatMessage {
+    /// Plain-text message constructor.
+    pub fn text(role: &str, content: &str) -> Self {
+        ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            content_parts: None,
+        }
+    }
+
+    /// Parse one OpenAI message object (`{"role": ..., "content": ...}`),
+    /// accepting string or content-part-array content. Returns `None`
+    /// when the role is missing.
+    pub fn from_openai(value: &serde_json::Value) -> Option<Self> {
+        let role = value["role"].as_str()?.to_string();
+        Some(match &value["content"] {
+            serde_json::Value::String(s) => ChatMessage {
+                role,
+                content: s.clone(),
+                content_parts: None,
+            },
+            parts @ serde_json::Value::Array(_) => ChatMessage {
+                role,
+                content: extract_content_text(parts),
+                content_parts: Some(parts.clone()),
+            },
+            _ => ChatMessage {
+                role,
+                content: String::new(),
+                content_parts: None,
+            },
+        })
+    }
+}
+
+/// Concatenate the text of OpenAI content parts: every
+/// `{"type":"text","text":...}` part contributes its text (parts without
+/// a `type` but with a string `text` field count too); image and other
+/// parts contribute nothing. Never panics on malformed parts.
+pub fn extract_content_text(parts: &serde_json::Value) -> String {
+    let Some(arr) = parts.as_array() else {
+        return String::new();
+    };
+    let mut out = Vec::new();
+    for part in arr {
+        if let Some(text) = part["text"].as_str()
+            && !text.is_empty()
+        {
+            out.push(text.to_string());
+        }
+    }
+    out.join("\n")
+}
+
+impl serde::Serialize for ChatMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("ChatMessage", 2)?;
+        st.serialize_field("role", &self.role)?;
+        match &self.content_parts {
+            Some(parts) => st.serialize_field("content", parts)?,
+            None => st.serialize_field("content", &self.content)?,
+        }
+        st.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ChatMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            role: String,
+            #[serde(default)]
+            content: Option<serde_json::Value>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(match &wire.content {
+            Some(parts @ serde_json::Value::Array(_)) => ChatMessage {
+                role: wire.role,
+                content: extract_content_text(parts),
+                content_parts: Some(parts.clone()),
+            },
+            Some(serde_json::Value::String(s)) => ChatMessage {
+                role: wire.role,
+                content: s.clone(),
+                content_parts: None,
+            },
+            _ => ChatMessage {
+                role: wire.role,
+                content: String::new(),
+                content_parts: None,
+            },
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,14 +366,7 @@ impl Engine {
     }
 
     pub fn chat(&self, prompt: &str, strip: bool, max_tokens: u32) -> anyhow::Result<ChatReply> {
-        self.chat_messages(
-            vec![ChatMessage {
-                role: "user".into(),
-                content: prompt.to_string(),
-            }],
-            strip,
-            max_tokens,
-        )
+        self.chat_messages(vec![ChatMessage::text("user", prompt)], strip, max_tokens)
     }
 
     /// Multi-turn chat: the full OpenAI message array reaches llama-server
@@ -994,14 +1095,7 @@ mod tests {
         assert!(engine.chat_messages(vec![], true, 64).is_err());
         assert!(
             engine
-                .chat_messages(
-                    vec![ChatMessage {
-                        role: "tool".into(),
-                        content: "x".into()
-                    }],
-                    true,
-                    64
-                )
+                .chat_messages(vec![ChatMessage::text("tool", "x")], true, 64)
                 .is_err()
         );
         if find_llama_server(None).is_some() {
@@ -1039,14 +1133,8 @@ mod tests {
         let reply = engine
             .chat_messages(
                 vec![
-                    ChatMessage {
-                        role: "system".into(),
-                        content: "You are a calculator.".into(),
-                    },
-                    ChatMessage {
-                        role: "user".into(),
-                        content: "What is 21 * 2?".into(),
-                    },
+                    ChatMessage::text("system", "You are a calculator."),
+                    ChatMessage::text("user", "What is 21 * 2?"),
                 ],
                 true,
                 128,
@@ -1059,15 +1147,101 @@ mod tests {
         // A single user turn behaves exactly like chat().
         let single = engine
             .chat_messages(
-                vec![ChatMessage {
-                    role: "user".into(),
-                    content: "What is 21 * 2?".into(),
-                }],
+                vec![ChatMessage::text("user", "What is 21 * 2?")],
                 true,
                 128,
             )
             .unwrap();
         assert!(single.text.contains("42"), "got {}", single.text);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn chat_message_multimodal_parsing_and_serialization() {
+        // OpenAI multimodal content array: text extracted, parts kept.
+        let payload = serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+            ]
+        });
+        let msg = ChatMessage::from_openai(&payload).unwrap();
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content, "What is in this image?");
+        assert!(msg.content_parts.is_some());
+        // Serialization restores the array intact for llama-server.
+        let wire = serde_json::to_value(&msg).unwrap();
+        assert_eq!(wire["content"], payload["content"]);
+        // Deserialization (the JNI chatMessages path) behaves identically.
+        let back: ChatMessage = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(back.content, "What is in this image?");
+        assert_eq!(back.content_parts, msg.content_parts);
+        // Plain strings stay plain strings end to end.
+        let plain = ChatMessage::text("user", "hello");
+        let wire = serde_json::to_value(&plain).unwrap();
+        assert_eq!(wire["content"], serde_json::json!("hello"));
+        let back: ChatMessage = serde_json::from_value(wire).unwrap();
+        assert!(back.content_parts.is_none());
+        // Malformed parts never panic and contribute no text.
+        assert_eq!(
+            extract_content_text(&serde_json::json!([
+                {"type": "image_url"},
+                {"text": 42},
+                "junk",
+                {"type": "text", "text": "kept"}
+            ])),
+            "kept"
+        );
+        assert_eq!(extract_content_text(&serde_json::json!("nope")), "");
+    }
+
+    #[test]
+    fn chat_messages_multimodal_builtin_uses_text_part() {
+        if find_llama_server(None).is_some() {
+            return; // builtin-only assertion
+        }
+        let engine = Engine::start(EngineConfig::default());
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("tiny-Q4_K_M.gguf");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&vibe_local_core::gguf::GGUF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let key = b"general.architecture";
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        let val = b"llama";
+        bytes.extend_from_slice(&(val.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(val);
+        std::fs::write(&model_path, bytes).unwrap();
+        engine
+            .load(LoadRequest {
+                path: model_path.to_string_lossy().into_owned(),
+                backend: "cpu".into(),
+                ngl: 0,
+                ctx: 0,
+                draft_model_path: None,
+                draft_ngl: None,
+                draft_max: None,
+                mmproj_path: None,
+                embedding: false,
+            })
+            .unwrap();
+        let msg = ChatMessage::from_openai(&serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is 21 * 2?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+            ]
+        }))
+        .unwrap();
+        let reply = engine.chat_messages(vec![msg], true, 128).unwrap();
+        // The builtin answered from the extracted text part alone.
+        assert!(reply.text.contains("42"), "got {}", reply.text);
+        assert_eq!(reply.engine, "builtin-microeval");
         engine.shutdown();
     }
 

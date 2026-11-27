@@ -6,6 +6,7 @@ pub mod llm_batch;
 pub mod mandelbrot;
 pub mod moe;
 pub mod primes;
+pub mod vision_batch;
 pub mod wordcount;
 
 use std::collections::BTreeMap;
@@ -54,7 +55,7 @@ impl Registry {
     }
 
     /// The full Vibe Grid registry: four compost classics + distributed MoE
-    /// + heterogeneous capability workloads (`embed_batch`).
+    /// + heterogeneous capability workloads (`embed_batch`, `vision_batch`).
     pub fn with_defaults() -> Registry {
         let mut r = Registry::new();
         r.register(Box::new(mandelbrot::Mandelbrot));
@@ -62,6 +63,7 @@ impl Registry {
         r.register(Box::new(wordcount::Wordcount));
         r.register(Box::new(llm_batch::LlmBatch));
         r.register(Box::new(embed_batch::EmbedBatch));
+        r.register(Box::new(vision_batch::VisionBatch));
         r.register(Box::new(moe::MoeDistributed));
         r
     }
@@ -121,11 +123,12 @@ mod tests {
                 "mandelbrot",
                 "moe_distributed",
                 "primes",
+                "vision_batch",
                 "wordcount"
             ]
         );
         assert!(r.get("primes").is_some());
         assert!(r.get("nope").is_none());
-        assert_eq!(r.info().len(), 6);
+        assert_eq!(r.info().len(), 7);
     }
 }

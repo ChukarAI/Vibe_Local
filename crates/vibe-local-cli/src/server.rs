@@ -522,16 +522,16 @@ fn route(
             // (system role + multi-turn intact); the builtin fallback
             // flattens internally and stays labeled builtin-microeval.
             let reply = if let Some(arr) = value["messages"].as_array() {
-                let messages: Vec<ChatMessage> = arr
+                // String content and OpenAI multimodal content-part
+                // arrays are both accepted; arrays reach llama-server
+                // intact while the builtin fallback uses the extracted
+                // text (see ChatMessage).
+                let messages: Vec<ChatMessage> =
+                    arr.iter().filter_map(ChatMessage::from_openai).collect();
+                let has_content = messages
                     .iter()
-                    .filter_map(|m| {
-                        Some(ChatMessage {
-                            role: m["role"].as_str()?.to_string(),
-                            content: m["content"].as_str().unwrap_or("").to_string(),
-                        })
-                    })
-                    .collect();
-                if messages.iter().all(|m| m.content.trim().is_empty()) {
+                    .any(|m| !m.content.trim().is_empty() || m.content_parts.is_some());
+                if !has_content {
                     return Ok(err_json(400, "messages must contain user content"));
                 }
                 state
@@ -893,11 +893,15 @@ fn extract_prompt(value: &serde_json::Value) -> String {
         let mut parts = Vec::new();
         for m in messages {
             let role = m["role"].as_str().unwrap_or("user");
-            let content = m["content"].as_str().unwrap_or("");
+            // Multimodal arrays contribute their text parts only.
+            let content = match m["content"].as_str() {
+                Some(s) => s.to_string(),
+                None => vibe_local_engine::supervisor::extract_content_text(&m["content"]),
+            };
             if role == "system" {
                 parts.push(format!("System: {content}"));
             } else if role == "user" {
-                parts.push(content.to_string());
+                parts.push(content);
             }
         }
         return parts.join("\n");
@@ -1299,6 +1303,60 @@ mod tests {
             .send_json(json!({"messages": []}))
             .unwrap_err();
         assert!(matches!(err, ureq::Error::Status(400, _)));
+    }
+
+    #[test]
+    fn chat_completions_accepts_multimodal_content_arrays() {
+        let (_h, base) = test_state(false, None);
+        // Load the tiny fixture so the builtin answers.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny-Q4_K_M.gguf");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&vibe_local_core::gguf::GGUF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let key = b"general.architecture";
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        let val = b"llama";
+        bytes.extend_from_slice(&(val.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(val);
+        std::fs::write(&path, bytes).unwrap();
+        ureq::post(&format!("{base}/api/load"))
+            .set("Content-Type", "application/json")
+            .send_json(json!({"path": path.to_string_lossy().into_owned()}))
+            .unwrap();
+        // Multimodal array: deserializes, the builtin answers from the
+        // extracted text part (the arithmetic path proves extraction).
+        let resp = ureq::post(&format!("{base}/v1/chat/completions"))
+            .set("Content-Type", "application/json")
+            .send_json(json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "What is 21 * 2?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+            ]}]}))
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.header("X-Vibe-Local-Engine"),
+            Some("builtin-microeval")
+        );
+        let v: serde_json::Value = resp.into_json().unwrap();
+        assert!(
+            v["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("42")
+        );
+        // An image-only message (no text part) is still valid content.
+        let resp = ureq::post(&format!("{base}/v1/chat/completions"))
+            .set("Content-Type", "application/json")
+            .send_json(json!({"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+            ]}]}))
+            .unwrap();
+        assert_eq!(resp.status(), 200);
     }
 
     #[test]

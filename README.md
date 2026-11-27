@@ -125,6 +125,7 @@ vibe-local cluster submit primes limit=10000000
 vibe-local cluster submit mandelbrot width=1920 height=1080 max_iter=1200 -o fractal.png
 vibe-local cluster submit llm_batch mode=verify --input prompts.txt   # uses Vibe Local :20129
 vibe-local cluster submit embed_batch mode=verify --input texts.txt  # embeddings; leases only to embed_rag nodes
+vibe-local cluster submit vision_batch mode=verify --input images.jsonl  # image Q&A; leases only to vision nodes
 vibe-local cluster submit moe_distributed model_id=OLMoE-1B-7B-0924-Instruct
 # Capability-targeted jobs only lease to nodes advertising that capability
 vibe-local cluster submit llm_batch mode=verify --input prompts.txt --required-capability llm
@@ -165,6 +166,20 @@ request; `mode=verify` uses the deterministic builtin embedding. The
 assembled artifact is a JSON array — one `{index, text_hash, embedding,
 engine}` row per input, in input order (`text_hash` = SHA-256 hex of the
 source text, `engine` = the engine that produced the vector).
+
+**`vision_batch` workload:** batch image understanding. Input is JSONL —
+`{"prompt": "…", "image_base64": "…"}` (optional `"mime_type"`, default
+`image/png`) or `{"prompt": "…", "image_url": "data:<mime>;base64,…"}`.
+Remote `http(s)` image URLs are rejected at parse time (workers never
+fetch URLs on a submitter's behalf), and every payload is base64-checked
+before a task exists. The preset stamps `required_capability: "vision"`.
+Live chunks call the node's multimodal `POST /v1/chat/completions` (the
+endpoint accepts OpenAI content-part arrays and passes them intact to
+llama-server; the builtin fallback answers from the extracted text);
+`mode=verify` produces a deterministic summary hash over each
+`{index, prompt, image_sha256, bytes}` labeled `"engine": "verify"`. The
+artifact is a JSON array of `{index, prompt, image_sha256, response,
+engine}` rows in input order.
 Coordinators also answer a UDP
 `VIBE_GRID_DISCOVER_V1` broadcast on port **20132** with
 `{service:"vibe-grid", coordinator_port, host, version}`, so
@@ -253,8 +268,11 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, data flow and SQLite
 ## Verification gates
 
 The same gates run in CI on every push and pull request to `main`
-(`.github/workflows/ci.yml`, jobs `rust-gates` and
-`python-bench-selftest` on Ubuntu, `contents: read` only):
+(`.github/workflows/ci.yml`, jobs `rust-gates`, `python-bench-selftest`
+and `android-build` on Ubuntu, `contents: read` only). The
+`android-build` job also compiles the Android app for real: JDK 17
+(temurin) + Gradle 8.9, wrapper bootstrapped in CI (the wrapper jar is
+not committed), `./gradlew assembleDebug` in `android/`:
 
 ```bash
 cargo fmt --all -- --check

@@ -29,6 +29,12 @@ are present. Regenerate the jar once, either by:
 
 After that, `./gradlew assembleDebug` works normally.
 
+**CI does exactly this on every push:** the `android-build` job in
+`.github/workflows/ci.yml` sets up JDK 17 (temurin) and Gradle 8.9,
+bootstraps the wrapper the same way, and runs
+`./gradlew assembleDebug` — so the app is compiled continuously even
+though the wrapper jar is not committed.
+
 ## Building the native library
 
 From the **repository root** (the Cargo workspace), with NDK r27 installed and
@@ -68,8 +74,9 @@ cd android
 ./gradlew assembleRelease      # minified + shrunk (see proguard-rules.pro)
 ```
 
-No Android SDK is required to *read* this source tree; the code is complete
-but has not been compiled on the authoring machine.
+No Android SDK is required to *read* this source tree. The code is not
+compiled on the authoring machine (no Android SDK there) — compilation
+is covered by the CI `android-build` job described above.
 
 ## Architecture
 

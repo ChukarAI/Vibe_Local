@@ -22,7 +22,7 @@ use crate::proto::{
     HeartbeatRequest, HeartbeatResponse, JOB_CANCELLED, JOB_DONE, JOB_FAILED, JOB_QUEUED,
     JOB_RUNNING, JoinRequest, JoinResponse, PollRequest, PollResponse, ResultMsg, StateResponse,
     SubmitJobRequest, SubmitJobResponse, TASK_EMBED_BATCH, TASK_LLM_BATCH, TASK_MOE_DISTRIBUTED,
-    TASK_WORDCOUNT,
+    TASK_VISION_BATCH, TASK_WORDCOUNT,
 };
 use crate::scheduler::Queue;
 use crate::workload::Registry;
@@ -867,6 +867,7 @@ fn route(
             if req.kind == TASK_WORDCOUNT
                 || req.kind == TASK_LLM_BATCH
                 || req.kind == TASK_EMBED_BATCH
+                || req.kind == TASK_VISION_BATCH
             {
                 let Some(input) = &req.input else {
                     return err_resp(
@@ -1064,7 +1065,10 @@ fn route(
 }
 
 fn is_sensitive(kind: &str) -> bool {
-    kind == TASK_WORDCOUNT || kind == TASK_LLM_BATCH || kind == TASK_EMBED_BATCH
+    kind == TASK_WORDCOUNT
+        || kind == TASK_LLM_BATCH
+        || kind == TASK_EMBED_BATCH
+        || kind == TASK_VISION_BATCH
 }
 
 /// Artifact/tile auth: checked BEFORE JobExists or LRU insertion.
@@ -1090,6 +1094,7 @@ pub fn annotate_eta(st: &mut StateResponse) {
     let mut working = 0;
     let mut llm_ready = 0;
     let mut embed_ready = 0;
+    let mut vision_ready = 0;
     let mut paused_reasons: Vec<String> = Vec::new();
     for n in &st.nodes {
         if !n.online {
@@ -1105,6 +1110,9 @@ pub fn annotate_eta(st: &mut StateResponse) {
         }
         if n.caps.capabilities.iter().any(|c| c == "embed_rag") && n.paused.is_empty() {
             embed_ready += 1;
+        }
+        if n.caps.capabilities.iter().any(|c| c == "vision") && n.paused.is_empty() {
+            vision_ready += 1;
         }
         if !n.paused.is_empty() && !paused_reasons.contains(&n.paused) {
             paused_reasons.push(n.paused.clone());
@@ -1141,6 +1149,15 @@ pub fn annotate_eta(st: &mut StateResponse) {
             && j.tasks_done == 0
         {
             j.waiting = "no online agents advertise the embed_rag capability".into();
+            continue;
+        }
+        if j.kind == TASK_VISION_BATCH
+            && !verify
+            && online > 0
+            && vision_ready == 0
+            && j.tasks_done == 0
+        {
+            j.waiting = "no online agents advertise the vision capability".into();
             continue;
         }
         if rate > 0.0 {
@@ -1571,6 +1588,125 @@ mod tests {
             rows[0]["embedding"].as_array().unwrap().len(),
             crate::workload::embed_batch::EMBED_DIM
         );
+        handle.shutdown();
+    }
+
+    #[test]
+    fn vision_batch_capability_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = start_coordinator(opts(dir.path())).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port);
+        let plain_caps = json!({"cores": 4, "mem_mb": 8192, "score": 1.0, "battery_pct": -1, "on_battery": false, "temp_c": -1, "arch": "x86_64", "os": "linux", "version": "0.7.0"});
+        let mut vision_caps = plain_caps.clone();
+        vision_caps["capabilities"] = json!(["llm", "vision"]);
+        vision_caps["loaded_models"] = json!(["llava-v1.6-Q4_K_M.gguf"]);
+        vision_caps["has_local_llm"] = json!(true);
+        let plain: serde_json::Value = post(
+            &base,
+            "/api/v1/join",
+            json!({"name": "plain", "caps": plain_caps}),
+            None,
+        )
+        .into_json()
+        .unwrap();
+        let vision: serde_json::Value = post(
+            &base,
+            "/api/v1/join",
+            json!({"name": "seer", "caps": vision_caps}),
+            None,
+        )
+        .into_json()
+        .unwrap();
+
+        // Submit a vision_batch job in verify mode. No
+        // required_capability is sent — the preset stamps "vision".
+        use base64::Engine;
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+        let input_text = format!(
+            "{{\"prompt\":\"describe\",\"image_base64\":\"{PNG_B64}\"}}\n{{\"prompt\":\"what color?\",\"image_url\":\"data:image/png;base64,{PNG_B64}\"}}\n{{\"prompt\":\"count dots\",\"image_base64\":\"{PNG_B64}\",\"mime_type\":\"image/png\"}}\n"
+        );
+        let input = base64::engine::general_purpose::STANDARD.encode(input_text.as_bytes());
+        let submit: serde_json::Value = post(
+            &base,
+            "/api/v1/jobs",
+            json!({"kind": "vision_batch", "params": {"batch_size": 2, "verify": 1}, "input": input}),
+            None,
+        )
+        .into_json()
+        .unwrap();
+        let job_id = submit["job"]["id"].as_str().unwrap().to_string();
+        assert_eq!(submit["job"]["kind"], "vision_batch");
+        assert_eq!(submit["job"]["required_capability"], "vision");
+        assert_eq!(submit["job"]["tasks_total"], 2);
+
+        // The plain node is never leased a vision task.
+        let p: serde_json::Value = post(
+            &base,
+            "/api/v1/poll",
+            json!({"node_id": plain["node_id"], "name": "plain", "caps": plain_caps, "running": 0, "workers": 1}),
+            None,
+        )
+        .into_json()
+        .unwrap();
+        assert!(p["task"].is_null());
+
+        // The vision node executes both chunks and reports results.
+        let preset = crate::workload::vision_batch::VisionBatch;
+        use crate::workload::Preset;
+        for _ in 0..2 {
+            let p: serde_json::Value = post(
+                &base,
+                "/api/v1/poll",
+                json!({"node_id": vision["node_id"], "name": "seer", "caps": vision_caps, "running": 0, "workers": 1}),
+                None,
+            )
+            .into_json()
+            .unwrap();
+            let task: crate::proto::Task = serde_json::from_value(p["task"].clone()).unwrap();
+            assert_eq!(task.kind, "vision_batch");
+            let (data, _) = preset.execute(&task).unwrap();
+            post(
+                &base,
+                "/api/v1/result",
+                json!({"task_id": task.id, "node_id": vision["node_id"], "lease_epoch": task.lease_epoch, "data": base64::engine::general_purpose::STANDARD.encode(&data), "millis": 5, "exec_millis": 5}),
+                None,
+            );
+        }
+
+        // Artifact assembles: JSON array of {index, prompt,
+        // image_sha256, response, engine} rows in input order.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut artifact = None;
+        while Instant::now() < deadline {
+            let resp = ureq::get(&format!("{base}/api/v1/jobs/{job_id}/artifact")).call();
+            if let Ok(r) = resp
+                && r.status() == 200
+            {
+                let mut buf = Vec::new();
+                r.into_reader().read_to_end(&mut buf).unwrap();
+                artifact = Some(buf);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let artifact = artifact.expect("vision artifact must assemble");
+        let rows: serde_json::Value = serde_json::from_slice(&artifact).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["index"], 0);
+        assert_eq!(rows[0]["prompt"], "describe");
+        assert_eq!(rows[1]["prompt"], "what color?");
+        assert_eq!(rows[2]["index"], 2);
+        assert_eq!(rows[0]["engine"], "verify");
+        {
+            use sha2::Digest;
+            let png = base64::engine::general_purpose::STANDARD
+                .decode(PNG_B64)
+                .unwrap();
+            let expect = vibe_local_core::util::hex_encode(&sha2::Sha256::digest(&png));
+            assert_eq!(rows[0]["image_sha256"], expect);
+            assert_eq!(rows[1]["image_sha256"], expect);
+        }
         handle.shutdown();
     }
 

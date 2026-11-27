@@ -14,6 +14,7 @@ pub const TASK_PRIMES: &str = "primes";
 pub const TASK_WORDCOUNT: &str = "wordcount";
 pub const TASK_LLM_BATCH: &str = "llm_batch";
 pub const TASK_EMBED_BATCH: &str = "embed_batch";
+pub const TASK_VISION_BATCH: &str = "vision_batch";
 pub const TASK_MOE_DISTRIBUTED: &str = "moe_distributed";
 
 pub const JOB_QUEUED: &str = "queued";
