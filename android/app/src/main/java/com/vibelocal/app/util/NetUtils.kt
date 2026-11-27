@@ -9,7 +9,7 @@ object NetUtils {
 
     /**
      * Best-effort LAN IPv4 address via NetworkInterface enumeration.
-     * Prefers wlan*/eth* interfaces; falls back to any site-local IPv4.
+     * Prefers wlan, eth or ap interfaces; falls back to any site-local IPv4.
      */
     fun lanIpv4(): String? {
         return try {
