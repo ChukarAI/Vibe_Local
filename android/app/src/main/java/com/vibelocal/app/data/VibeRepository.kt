@@ -369,7 +369,7 @@ class VibeRepository(
         }
     }
 
-    private fun gridHttpGet(path: String): Result<Any> {
+    private suspend fun gridHttpGet(path: String): Result<Any> {
         val saved = http.token
         http.token = prefs.gridKey
         try {
@@ -379,7 +379,7 @@ class VibeRepository(
         }
     }
 
-    private fun gridHttpPost(path: String, body: JSONObject): Result<Any> {
+    private suspend fun gridHttpPost(path: String, body: JSONObject): Result<Any> {
         val saved = http.token
         http.token = prefs.gridKey
         try {
